@@ -1,54 +1,58 @@
 #!/system/bin/sh
-# Magisk 模块安装脚本 — Aether OptExt
+# Aether OptExt — Magisk/KernelSU 安装脚本
 
 set_perm_recursive $MODPATH 0 0 0755 0644
 set_perm $MODPATH/aether-optext 0 0 0755
 
-# 自动检测 CPU 拓扑 (通过 cpufreq policy 集群)
+# 清除旧缓存
+rm -f /sdcard/Android/Aether/threads_cache 2>/dev/null
+
+# 按频率检测 CPU 集群
 detect_topology() {
-    local counts=""
+    local freq_list=""
     for policy in /sys/devices/system/cpu/cpufreq/policy[0-9]*; do
         [ -d "$policy" ] || continue
         local cpus=$(cat "$policy/related_cpus" 2>/dev/null)
+        local freq=$(cat "$policy/cpuinfo_max_freq" 2>/dev/null)
         [ -z "$cpus" ] && continue
-        # 计算该集群核心数
         local count=0
-        for c in $(echo "$cpus" | tr ',' ' ' | tr '-' ' '); do
-            count=$((count + 1))
-        done
-        # 如果有 range 如 "0-5" 则计算区间长度
         if echo "$cpus" | grep -q '-'; then
-            local start=$(echo "$cpus" | cut -d'-' -f1)
-            local end=$(echo "$cpus" | cut -d'-' -f2)
-            count=$((end - start + 1))
+            local s=$(echo "$cpus" | cut -d'-' -f1)
+            local e=$(echo "$cpus" | cut -d'-' -f2)
+            count=$((e - s + 1))
+        else
+            for c in $(echo "$cpus" | tr ',' ' '); do count=$((count + 1)); done
         fi
-        counts="$counts $count"
+        freq_list="$freq_list $freq:$count"
     done
-
-    # policy 编号即集群顺序 (policy0=little, 依次递增)
-    local topo=$(echo "$counts" | xargs | tr ' ' '\n' | tr '\n' '+' | sed 's/^+//;s/+$//')
-    [ -z "$topo" ] && topo="unknown"
-    echo "$topo"
+    # 按频率降序 (高频=大核优先)
+    local result=""
+    for pair in $freq_list; do
+        local best=""
+        local best_val=0
+        for p in $freq_list; do
+            local f=${p%:*}
+            local c=${p#*:}
+            if [ $f -gt $best_val ] 2>/dev/null; then
+                best="$p"
+                best_val=$f
+            fi
+        done
+        [ -n "$best" ] && result="$result ${best#*:}" && freq_list=${freq_list/$best/}
+    done
+    [ -n "$result" ] && echo "$result" | tr ' ' '+' || echo "unknown"
 }
 
-# 部署配置文件
 TARGET="/sdcard/Android/Aether"
-mkdir -p "$TARGET"
+mkdir -p "$TARGET" 2>/dev/null
 
 TOPOLOGY=$(detect_topology)
-ui_print "- 检测到 CPU 拓扑: $TOPOLOGY"
+ui_print "- CPU: $TOPOLOGY"
 
-# 查找匹配的拓扑配置
-CONFIG_SRC="$MODPATH/config/${TOPOLOGY}.json"
-if [ -f "$CONFIG_SRC" ]; then
-    ui_print "- 使用拓扑适配配置: $TOPOLOGY"
-else
-    CONFIG_SRC="$MODPATH/threads.json"
-    ui_print "- 使用默认配置"
+if [ -f "$MODPATH/config/${TOPOLOGY}.json" ]; then
+    cp "$MODPATH/config/${TOPOLOGY}.json" "$TARGET/threads.json" 2>/dev/null
+    ui_print "- 配置文件已部署"
 fi
 
-cp "$CONFIG_SRC" "$TARGET/threads.json" 2>/dev/null
-ui_print "- 配置文件已部署到 $TARGET"
-
-ui_print "- Aether OptExt v0713-Dev 安装完成"
-ui_print "- 日志文件: /sdcard/Android/Aether/threads_log.txt"
+ui_print "- Aether OptExt 安装完成"
+ui_print "- 日志: /sdcard/Android/Aether/threads_log.txt"
