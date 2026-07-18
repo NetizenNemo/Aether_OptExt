@@ -29,17 +29,7 @@ fn main() {
             .map(|mut f| write!(f, "[PANIC] {} at {}\n", msg, loc));
     }));
 
-    let lock = "/sdcard/Android/Aether/run.pid";
     let _ = fs::create_dir_all("/sdcard/Android/Aether");
-    if let Ok(old) = fs::read_to_string(lock) {
-        if let Ok(pid) = old.trim().parse::<i32>() {
-            if unsafe { libc::kill(pid, 0) } == 0 {
-                eprintln!("已有实例运行 (PID={})", pid);
-                return;
-            }
-        }
-    }
-    fs::write(lock, format!("{}\n", std::process::id())).ok();
     fs::write(log::PATH, "").ok();
 
     let args: Vec<String> = env::args().collect();
