@@ -138,20 +138,20 @@ fn main() {
             }
         }
 
-        // 进程数检测
-        let mut si: libc::sysinfo = unsafe { mem::zeroed() };
-        if unsafe { libc::sysinfo(&mut si) } != 0 { nr = true; }
-        else {
-            let cur = si.procs as i32;
-            if cur > lc + 10 { nr = true; }
-            else if cur > lc { cnt = 0; }
-            lc = cur;
-        }
-
-        // kill 检测
-        if !nr {
-            for (pid, _, _) in &cache {
-                if unsafe { libc::kill(*pid, 0) } != 0 { nr = true; break; }
+        // 进程数检测 (每 5 轮才重扫一次)
+        if cache_scan % 5 == 0 {
+            let mut si: libc::sysinfo = unsafe { mem::zeroed() };
+            if unsafe { libc::sysinfo(&mut si) } != 0 { nr = true; }
+            else {
+                let cur = si.procs as i32;
+                if cur > lc + 10 { nr = true; }
+                else if cur > lc { cnt = 0; }
+                lc = cur;
+            }
+            if !nr {
+                for (pid, _, _) in &cache {
+                    if unsafe { libc::kill(*pid, 0) } != 0 { nr = true; break; }
+                }
             }
         }
 
