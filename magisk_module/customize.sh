@@ -7,40 +7,27 @@ set_perm $MODPATH/aether-optext 0 0 0755
 # 清除旧缓存
 rm -f /sdcard/Android/Aether/threads_cache 2>/dev/null
 
-# 按频率检测 CPU 集群
+# 按频率检测 CPU 拓扑
 detect_topology() {
-    local freq_list=""
+    local counts=""
     for policy in /sys/devices/system/cpu/cpufreq/policy[0-9]*; do
         [ -d "$policy" ] || continue
         local cpus=$(cat "$policy/related_cpus" 2>/dev/null)
-        local freq=$(cat "$policy/cpuinfo_max_freq" 2>/dev/null)
         [ -z "$cpus" ] && continue
         local count=0
-        if echo "$cpus" | grep -q '-'; then
-            local s=$(echo "$cpus" | cut -d'-' -f1)
-            local e=$(echo "$cpus" | cut -d'-' -f2)
-            count=$((e - s + 1))
-        else
-            for c in $(echo "$cpus" | tr ',' ' '); do count=$((count + 1)); done
-        fi
-        freq_list="$freq_list $freq:$count"
-    done
-    # 按频率降序 (高频=大核优先)
-    local result=""
-    for pair in $freq_list; do
-        local best=""
-        local best_val=0
-        for p in $freq_list; do
-            local f=${p%:*}
-            local c=${p#*:}
-            if [ $f -gt $best_val ] 2>/dev/null; then
-                best="$p"
-                best_val=$f
-            fi
+        for c in $(echo "$cpus" | tr ',' ' ' | tr '-' ' '); do
+            count=$((count + 1))
         done
-        [ -n "$best" ] && result="$result ${best#*:}" && freq_list=${freq_list/$best/}
+        if echo "$cpus" | grep -q '-'; then
+            local start=$(echo "$cpus" | cut -d'-' -f1)
+            local end=$(echo "$cpus" | cut -d'-' -f2)
+            count=$((end - start + 1))
+        fi
+        counts="$counts $count"
     done
-    [ -n "$result" ] && echo "$result" | tr ' ' '+' || echo "unknown"
+    local topo=$(echo "$counts" | xargs | tr ' ' '\n' | tr '\n' '+' | sed 's/^+//;s/+$//')
+    [ -z "$topo" ] && topo="unknown"
+    echo "$topo"
 }
 
 TARGET="/sdcard/Android/Aether"
@@ -51,7 +38,9 @@ ui_print "- CPU: $TOPOLOGY"
 
 if [ -f "$MODPATH/config/${TOPOLOGY}.json" ]; then
     cp "$MODPATH/config/${TOPOLOGY}.json" "$TARGET/threads.json" 2>/dev/null
-    ui_print "- 配置文件已部署"
+    ui_print "- 配置已部署"
+else
+    [ -f "$TARGET/threads.json" ] || ui_print "- 请手动配置 threads.json"
 fi
 
 ui_print "- Aether OptExt 安装完成"
