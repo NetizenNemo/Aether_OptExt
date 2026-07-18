@@ -56,6 +56,7 @@ fn main() {
     }
     if interval < 1 { interval = 1; }
 
+    info!("[1] CPU info");
     info!("CPU: {} cpuset={}", cpu::present(), Path::new("/dev/cpuset").exists());
 
     let mut cfg = match AppConfig::load(&config_path) {
@@ -67,12 +68,15 @@ fn main() {
     // 合并缓存
     let mut all_w = cfg.wild.clone();
     cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
+    info!("[2] cache merged");
     info!("共 {} 条规则 (含缓存)", cfg.rules.len());
 
+    info!("[3] detect");
     let (big, little, topo) = cpu::detect();
     info!("拓扑: {} (大核={} 小核={})", topo, big, little);
 
     // 初始化 cpuset
+    info!("[4] cpuset init");
     process::init_cpuset();
 
     // 自身限定在小核运行
@@ -96,6 +100,7 @@ fn main() {
     }
 
     // eBPF
+    info!("[5] bpf probe");
     let bpf = bpf::probe(cfg.ebpf);
 
     let _ = fs::create_dir_all("/sdcard/Android/Aether");
@@ -116,6 +121,7 @@ fn main() {
     let mut cache_scan = 0i32;
     let mut cache: Vec<(i32, String, Vec<(i32, String, String)>)> = Vec::new();
     let rf = AtomicBool::new(false);
+    info!("[6] loop start");
     info!("启动");
 
     loop {
