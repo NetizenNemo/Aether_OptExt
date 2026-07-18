@@ -130,6 +130,10 @@ pub mod cache {
                 let load = est_load(comm);
                 if load >= 8 { big_names.push(comm.clone()); }
                 else { lil_names.push(comm.clone()); }
+                if comm.contains("Render") || comm.contains("Codec") || comm.contains("Audio") {
+                    info!("save: {} load={} -> {} (big={} little={})", comm, load,
+                        if load>=8{"big"}else{"lil"}, big, little);
+                }
             }
         }
 
@@ -162,6 +166,7 @@ pub mod cache {
     }
 
     fn est_load(name: &str) -> i32 {
+        info!("est_load: {} -> {}", name, if name.contains("Render")||name.contains("Gfx")||name.contains("GL")||name.contains("Vulkan") {10} else if name.contains("Decode")||name.contains("Codec")||name.contains("Video")||name.contains("Audio") {8} else if name.contains("Main")||name.contains("Unity")||name.contains("Game") {9} else if name.contains("Worker")||name.contains("Thread")||name.contains("Job") {5} else if name.contains("Io")||name.contains("Network")||name.contains("Http") {3} else if name.contains("Background")||name.contains("Idle")||name.contains("Pool") {1} else {4});
         if name.contains("Render") || name.contains("Gfx") || name.contains("GL") || name.contains("Vulkan") { return 10; }
         if name.contains("Decode") || name.contains("Codec") || name.contains("Video") || name.contains("Audio") { return 8; }
         if name.contains("Main") || name.contains("Unity") || name.contains("Game") { return 9; }
