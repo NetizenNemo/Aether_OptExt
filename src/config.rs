@@ -112,9 +112,9 @@ pub mod cache {
         info!("已加载 {} 条缓存", root.members().count());
     }
 
-    pub fn save(pkg: &str, all: &[(i32, String, Vec<(i32, String)>)], big: &str, little: &str) {
-        // 只过滤特定系统服务，不过滤全部 MIUI/Xiaomi
-        if pkg.ends_with(":widgetProvider") || pkg.ends_with(":searchDataService")
+    /// 黑名单: 已知无需记忆的系统服务
+    pub fn is_blacklisted(pkg: &str) -> bool {
+        pkg.ends_with(":widgetProvider") || pkg.ends_with(":searchDataService")
             || pkg.ends_with(":coreService") || pkg.ends_with(":cognitionService")
             || pkg.ends_with(":bert") || pkg.ends_with(":bertAlgo")
             || pkg.ends_with(":privacy") || pkg.ends_with(":kit7")
@@ -122,7 +122,12 @@ pub mod cache {
             || pkg == "android.process.media" || pkg == "android.process.acore"
             || pkg.starts_with("com.qualcomm.") || pkg.starts_with(".qti")
             || pkg.starts_with(".qms") || pkg.starts_with(".cacert")
-            || pkg.starts_with(".dataservices") { return; }
+            || pkg.starts_with(".dataservices")
+    }
+
+    pub fn save(pkg: &str, all: &[(i32, String, Vec<(i32, String)>)], big: &str, little: &str) {
+        // 只过滤特定系统服务，不过滤全部 MIUI/Xiaomi
+        if is_blacklisted(pkg) { return; }
         let mut big_names = Vec::new();
         let mut lil_names = Vec::new();
         for (_, _n, th) in all.iter().filter(|(_, n, _)| n == pkg) {

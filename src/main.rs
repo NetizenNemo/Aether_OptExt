@@ -90,6 +90,7 @@ fn main() {
     // 启动时自动分配
     let unknown = process::scan_unknown(&cfg.pkg_set, &all_w);
     for (_pid, pkg, th) in &unknown {
+        if config::cache::is_blacklisted(pkg) { continue; }
         info!("新应用: {} ({} 线程)", pkg, th.len());
         cache::save(pkg, &unknown, &big, &little);
     }
@@ -125,6 +126,7 @@ fn main() {
             cache_scan = 0;
             let u = process::scan_unknown(&cfg.pkg_set, &all_w);
             for (_pid, pkg, th) in &u {
+                if config::cache::is_blacklisted(pkg) { continue; }
                 info!("新应用: {} ({} 线程)", pkg, th.len());
                 cache::save(pkg, &u, &big, &little);
             }
