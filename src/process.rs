@@ -36,7 +36,7 @@ fn cpuset_add(tid: i32, cpus: &str) {
 
 pub fn scan(rules: &[Rule], set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String, Vec<(i32, String, String)>)> {
     let mut result = Vec::new();
-    let mut buf = [0i8; 8192];
+    let mut buf = [0u8; 8192];
     let fd = unsafe { libc::open("/proc\0".as_ptr() as *const _, libc::O_RDONLY | libc::O_DIRECTORY) };
     if fd < 0 { return result; }
     loop {
