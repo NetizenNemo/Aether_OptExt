@@ -82,7 +82,7 @@ impl AppConfig {
 
 pub mod cache {
     use std::{collections::HashSet, fs};
-    use super::{Rule, fnmatch};
+    use super::Rule;
 
     const FILE: &str = "/sdcard/Android/Aether/threads_cache";
 
@@ -125,7 +125,7 @@ pub mod cache {
             || pkg.starts_with(".dataservices") { return; }
         let mut big_names = Vec::new();
         let mut lil_names = Vec::new();
-        for (_, n, th) in all.iter().filter(|(_, n, _)| n == pkg) {
+        for (_, _n, th) in all.iter().filter(|(_, n, _)| n == pkg) {
             for (_, comm) in th {
                 let load = est_load(comm);
                 if load >= 8 { big_names.push(comm.clone()); }

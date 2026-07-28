@@ -55,9 +55,9 @@ pub fn detect() -> (String, String, String) {
         if total > known && known > 0 {
             let known_set: std::collections::HashSet<usize> =
                 cls.iter().flat_map(|(_, c)| c.iter()).cloned().collect();
-            let mut extra: Vec<usize> = (0..total).filter(|c| !known_set.contains(c)).collect();
+            let extra: Vec<usize> = (0..total).filter(|c| !known_set.contains(c)).collect();
             if !extra.is_empty() {
-                let mut cur = cls.remove(0).1;
+                let cur = cls.remove(0).1;
                 cls.push((1, extra));  // 未检测到的核作为大核
                 cls.push((0, cur));    // 已知核作为小核
             }

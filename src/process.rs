@@ -1,7 +1,8 @@
-use std::{collections::HashSet, fs, mem};
-use crate::config::{self, Rule, fnmatch};
+use std::{collections::{HashMap, HashSet}, fs, mem, sync::{Mutex, OnceLock}};
+use crate::config::{Rule, fnmatch};
 
 static CPUSET_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAST_AFFINITY: OnceLock<Mutex<HashMap<i32, String>>> = OnceLock::new();
 
 /// 初始化 cpuset 目录
 pub fn init_cpuset() {
@@ -120,9 +121,18 @@ pub fn scan_unknown(set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String,
 pub fn apply(procs: &[(i32, String, Vec<(i32, String, String)>)], rescan: &std::sync::atomic::AtomicBool) {
     let mut seen_cpus = std::collections::HashSet::<String>::new();
     let mut n = 0usize;
+    let mut live_tids: HashSet<i32> = HashSet::new();
+    // 复制快照以便在持有锁时不长时间阻塞其他读者
+    let mut last = LAST_AFFINITY.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     for (_, _, th) in procs {
         for (tid, _, cpus) in th {
             if cpus.is_empty() { continue; }
+            live_tids.insert(*tid);
+
+            // 去重: 上次绑定的 cpus 完全相同则跳过, 不计数, 不打日志
+            if last.get(tid).map(|s| s == cpus).unwrap_or(false) {
+                continue;
+            }
             n += 1;
 
             // 确保 cpuset 目录存在 (仅首次)
@@ -154,7 +164,17 @@ pub fn apply(procs: &[(i32, String, Vec<(i32, String, String)>)], rescan: &std::
 
             // cpuset 写入
             cpuset_add(*tid, cpus);
+
+            // 记录这次绑定的 cpus
+            last.insert(*tid, cpus.clone());
         }
     }
-    info!("已绑核 {} 进程 {} 线程", procs.len(), n);
+
+    // 清理已死进程的条目 (避免 Map 无限增长 + PID 复用问题)
+    last.retain(|tid, _| live_tids.contains(tid));
+    drop(last);
+
+    if n > 0 {
+        info!("已绑核 {} 进程 {} 线程", procs.len(), n);
+    }
 }

@@ -2,8 +2,7 @@ use std::{
     env, fs, io::Write, mem,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, SystemTime},
-    collections::HashSet,
+    time::Duration,
 };
 
 #[macro_use]
@@ -13,10 +12,7 @@ mod cpu;
 mod process;
 mod bpf;
 
-use log::*;
 use config::*;
-use cpu::*;
-use process::*;
 
 fn main() {
     // 进程锁
@@ -55,7 +51,7 @@ fn main() {
     info!("已加载 {} 条规则", cfg.rules.len());
 
     // 合并缓存
-    let mut all_w = cfg.wild.clone();
+    let all_w = cfg.wild.clone();
     cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
     info!("共 {} 条规则 (含缓存)", cfg.rules.len());
 
@@ -93,7 +89,7 @@ fn main() {
 
     // 启动时自动分配
     let unknown = process::scan_unknown(&cfg.pkg_set, &all_w);
-    for (pid, pkg, th) in &unknown {
+    for (_pid, pkg, th) in &unknown {
         info!("新应用: {} ({} 线程)", pkg, th.len());
         cache::save(pkg, &unknown, &big, &little);
     }
@@ -128,7 +124,7 @@ fn main() {
         if cache_scan >= 30 {
             cache_scan = 0;
             let u = process::scan_unknown(&cfg.pkg_set, &all_w);
-            for (pid, pkg, th) in &u {
+            for (_pid, pkg, th) in &u {
                 info!("新应用: {} ({} 线程)", pkg, th.len());
                 cache::save(pkg, &u, &big, &little);
             }
