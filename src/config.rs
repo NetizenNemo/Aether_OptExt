@@ -27,6 +27,33 @@ pub struct Rule {
     pub cpuset_dir: String,
 }
 
+/// 解析单个 JSON 条目的结构化结果
+pub struct ParsedEntry {
+    pub packages: Vec<String>,
+    pub other_cpus: String,
+    /// (cpus, thread_name, prio)
+    pub thread_rules: Vec<(String, String, i32)>,
+}
+
+/// 从 JSON 条目中提取 packages / other_cpus / thread_rules
+pub fn parse_entry(entry: &json::JsonValue) -> Option<ParsedEntry> {
+    let pl: Vec<String> = entry["packages"].members()
+        .filter_map(|v| v.as_str().map(String::from)).collect();
+    if pl.is_empty() { return None; }
+    let other = entry["cpuset"]["other"].as_str().unwrap_or("0").to_string();
+    let mut thread_rules = Vec::new();
+    if entry["cpuset"]["comm"].is_object() {
+        for (cpus, names) in entry["cpuset"]["comm"].entries() {
+            for nv in names.members() {
+                if let Some(name) = nv.as_str() {
+                    thread_rules.push((cpus.to_string(), name.to_string(), rule_prio(name)));
+                }
+            }
+        }
+    }
+    Some(ParsedEntry { packages: pl, other_cpus: other, thread_rules })
+}
+
 #[derive(Clone)]
 pub struct AppConfig {
     pub rules: Vec<Rule>,
@@ -83,18 +110,15 @@ impl AppConfig {
         let mut wild = Vec::new();
 
         for e in entries.members() {
-            let pl: Vec<String> = e["packages"].members()
-                .filter_map(|v| v.as_str().map(String::from)).collect();
-            if pl.is_empty() { continue; }
-            let other = e["cpuset"]["other"].as_str().unwrap_or("0");
-            let def = pl[0].clone();
+            let Some(pe) = parse_entry(e) else { continue };
+            let def = pe.packages[0].clone();
 
-            for pk in &pl {
+            for pk in &pe.packages {
                 pkg_set.insert(pk.clone());
                 if pk.contains('*') || pk.contains('?') { wild.push(pk.clone()); }
             }
 
-            let other_set = crate::cpuset::from_range(other);
+            let other_set = crate::cpuset::from_range(&pe.other_cpus);
             let other_dir = other_set.to_range_string();
             let other_cpuset_dir = if topo.cpuset_enabled {
                 crate::cpuset::create_cpuset_dir(
@@ -104,22 +128,16 @@ impl AppConfig {
             } else {
                 String::new()
             };
-            rules.push(Rule { pkg: def.clone(), thread: String::new(), cpus: other.to_string(), prio: 200, cpuset_dir: other_cpuset_dir });
+            rules.push(Rule { pkg: def.clone(), thread: String::new(), cpus: pe.other_cpus, prio: 200, cpuset_dir: other_cpuset_dir });
 
-            if e["cpuset"]["comm"].is_object() {
-                for (cpus, names) in e["cpuset"]["comm"].entries() {
-                    for nv in names.members() {
-                        if let Some(name) = nv.as_str() {
-                            rules.push(Rule {
-                                pkg: def.clone(),
-                                thread: name.to_string(),
-                                cpus: cpus.to_string(),
-                                prio: rule_prio(name),
-                                cpuset_dir: String::new(),
-                            });
-                        }
-                    }
-                }
+            for (cpus, name, prio) in &pe.thread_rules {
+                rules.push(Rule {
+                    pkg: def.clone(),
+                    thread: name.clone(),
+                    cpus: cpus.clone(),
+                    prio: *prio,
+                    cpuset_dir: String::new(),
+                });
             }
         }
 
@@ -164,22 +182,14 @@ pub mod cache {
         if !root.is_array() { return; }
         let mut seen_pkgs = HashSet::new();
         for entry in root.members() {
-            let pl: Vec<String> = entry["packages"].members()
-                .filter_map(|v| v.as_str().map(String::from)).collect();
-            if pl.is_empty() { continue; }
+            let Some(pe) = super::parse_entry(entry) else { continue };
+            let def = pe.packages[0].clone();
             // 去重：同名包只保留最后一条（最新）
-            if !seen_pkgs.insert(pl[0].clone()) { continue; }
-            let other = entry["cpuset"]["other"].as_str().unwrap_or("0");
-            for pk in &pl { set.insert(pk.clone()); }
-            rules.push(Rule { pkg: pl[0].clone(), thread: String::new(), cpus: other.to_string(), prio: 200, cpuset_dir: String::new() });
-            if entry["cpuset"]["comm"].is_object() {
-                for (cpus, names) in entry["cpuset"]["comm"].entries() {
-                    for nv in names.members() {
-                        if let Some(name) = nv.as_str() {
-                            rules.push(Rule { pkg: pl[0].clone(), thread: name.to_string(), cpus: cpus.to_string(), prio: super::rule_prio(name), cpuset_dir: String::new() });
-                        }
-                    }
-                }
+            if !seen_pkgs.insert(def.clone()) { continue; }
+            for pk in &pe.packages { set.insert(pk.clone()); }
+            rules.push(Rule { pkg: def.clone(), thread: String::new(), cpus: pe.other_cpus, prio: 200, cpuset_dir: String::new() });
+            for (cpus, name, prio) in &pe.thread_rules {
+                rules.push(Rule { pkg: def.clone(), thread: name.clone(), cpus: cpus.clone(), prio: *prio, cpuset_dir: String::new() });
             }
         }
         info!("cache entries loaded: {}", seen_pkgs.len());

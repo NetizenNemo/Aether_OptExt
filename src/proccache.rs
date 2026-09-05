@@ -95,10 +95,10 @@ impl ProcCache {
         let mut dead_tids = Vec::new();
         for (tid, e) in self.tasks.iter_mut() {
             if e.failed { continue; }  // 上次失败（cpuset 限制），跳过无效重试
-            if process::affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
-                dead_tids.push(*tid);
-            } else {
-                e.failed = true;
+            match process::affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
+                process::AffinityResult::Dead => dead_tids.push(*tid),
+                process::AffinityResult::Failed => e.failed = true,
+                process::AffinityResult::Ok => {}  // 成功，不标记失败
             }
         }
         for tid in &dead_tids {

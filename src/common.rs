@@ -13,7 +13,9 @@ pub fn set_base_cpuset(name: &str) {
         return;
     }
     let path = format!("/dev/cpuset/{}", name);
-    let _ = BASE_CPUSET_PATH.set(path);
+    if BASE_CPUSET_PATH.set(path).is_err() {
+        crate::warn!("BASE_CPUSET 已设置，忽略重复调用 ({})", name);
+    }
 }
 
 /// 获取 BASE_CPUSET 路径，未设置返回默认值

@@ -1,4 +1,4 @@
-use std::{fs, io::Write, sync::atomic::{AtomicUsize, Ordering}};
+use std::{fs, io::Write, mem::MaybeUninit, sync::atomic::{AtomicUsize, Ordering}};
 
 pub const PATH: &str = "/sdcard/Android/Aether/threads_log.txt";
 const MAX_SIZE: u64 = 512 * 1024;
@@ -10,8 +10,7 @@ static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// 统一日志格式: [I] MM-DD HH:MM:SS: message
 pub fn write(level: char, msg: &str) {
     let mut now: libc::time_t = 0;
-    // SAFETY: tm 是 POD 零初始化安全；time()/localtime_r() 可重入，无数据竞争
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let mut tm: libc::tm = unsafe { MaybeUninit::zeroed().assume_init() };
     unsafe {
         libc::time(&mut now);
         libc::localtime_r(&now, &mut tm);

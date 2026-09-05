@@ -6,6 +6,16 @@ use std::fs;
 use crate::cpuset::CpuSet;
 use crate::config::fnmatch;
 
+/// 绑核结果三态
+pub enum AffinityResult {
+    /// 成功绑核 或 已处于目标亲和性（短路跳过）
+    Ok,
+    /// 线程已退出（ESRCH）
+    Dead,
+    /// 绑核真正失败（非 ESRCH），后续应跳过无效重试
+    Failed,
+}
+
 /// 记录已报告失败的 (tid, cpus)，同一组合只报一次
 static FAILED_ONCE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(i32, String)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -47,12 +57,11 @@ pub fn scan_unknown(set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String,
 }
 
 /// 应用绑核：sched_getaffinity 短路 → sched_setaffinity → cpuset 写入
-/// 返回 (进程数, 总线程数, 新增绑定数)
-#[allow(dead_code)]
-pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpuset::CpuTopology) -> bool {
+/// 返回 AffinityResult 三态：Ok=成功, Dead=线程退出, Failed=真正失败
+pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpuset::CpuTopology) -> AffinityResult {
     // sched_getaffinity 短路：已符合目标零开销返回
     if let Some(curr) = CpuSet::get_affinity(tid) {
-        if curr == *cpus { return false; }
+        if curr == *cpus { return AffinityResult::Ok; }
     }
 
     let mut tasks_path: Option<String> = None;
@@ -71,7 +80,7 @@ pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpu
     }
 
     if let Err(e) = cpus.set_affinity(tid) {
-        if e.raw_os_error() == Some(3) { return true; }  // ESRCH: 线程已退出
+        if e.raw_os_error() == Some(3) { return AffinityResult::Dead; }  // ESRCH: 线程已退出
         // EINVAL: 迁移可能未生效，重写 tasks 再重试一次（双保险）
         if e.raw_os_error() == Some(22) && topo.cpuset_enabled {
             if let Some(p) = &tasks_path {
@@ -81,19 +90,20 @@ pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpu
                     .and_then(|mut f| f.write_all(format!("{}\n", tid).as_bytes()));
             }
             if let Err(e2) = cpus.set_affinity(tid) {
-                if e2.raw_os_error() == Some(3) { return true; }
+                if e2.raw_os_error() == Some(3) { return AffinityResult::Dead; }
                 crate::error!("[E] bind failed (retry) tid={} cpus={} ({})", tid,
                     cpus.to_range_string(), e2);
-                return false;
+                return AffinityResult::Failed;
             }
-            return false;  // 重试成功
+            return AffinityResult::Ok;  // 重试成功
         }
         let mut seen = FAILED_ONCE.lock().unwrap_or_else(|p| p.into_inner());
         if seen.insert((tid, cpus.to_range_string())) {
             crate::info!("绑核失败 tid={} cpus={} ({})", tid, cpus.to_range_string(), e);
         }
+        return AffinityResult::Failed;
     }
-    false
+    AffinityResult::Ok
 }
 
 /// 读 /proc/{pid}/cmdline 取包名

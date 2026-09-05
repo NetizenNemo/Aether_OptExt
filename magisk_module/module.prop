@@ -1,6 +1,6 @@
 id=aether-optext
 name=Aether OptExt
-version=0805-Release
-versionCode=260805
+version=0828-Release
+versionCode=260828
 author=NekoNemo
 description=Aether OptExt - Android CPU affinity optimizer

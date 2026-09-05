@@ -7,7 +7,7 @@ VERSION = "1.0.0"
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUT_DIR = SCRIPT_DIR / "out"
 MODULE_DIR = SCRIPT_DIR / "magisk_module"
-MODULE_ZIP = OUT_DIR / f"Aether-OptExt_{datetime.now():%Y%m%d_%H%M%S}.zip"
+MODULE_ZIP = OUT_DIR / f"Aether-OptExt_{datetime.now():%Y%m%d_%H%M%S}-OS4.zip"
 TARGET = "aarch64-linux-android"
 
 def info(m): print(f"[INFO] {m}")
@@ -69,8 +69,7 @@ def find_ndk():
             if sys.platform == "win32": linker = linker.with_suffix(".cmd")
             if linker.exists(): info(f"NDK: {ndk_dir}"); return ndk_dir, tag, linker
     # 常见路径兜底
-    for base_str in [str(Path.home() / "Android/Sdk"), str(Path.home() / "AppData/Local/Android/Sdk"),
-                     "C:/Users/shenz/AppData/Local/Android/Sdk"]:
+    for base_str in [str(Path.home() / "Android/Sdk"), str(Path.home() / "AppData/Local/Android/Sdk")]:
         base = Path(base_str)
         if not base.exists(): continue
         ndk_dir = next(iter(sorted(base.glob("ndk/*"), reverse=True)), None)
@@ -90,6 +89,8 @@ def build(ndk_info):
     env = os.environ.copy()
     if ndk_info:
         ndk_dir, host_tag, linker = ndk_info
+        if ndk_dir is None:
+            die("无 NDK，无法交叉编译 aarch64-linux-android")
         tc = ndk_dir / "toolchains/llvm/prebuilt" / host_tag
         env["CC_aarch64_linux_android"] = str(linker)
         env["AR_aarch64_linux_android"] = str(tc / "bin/llvm-ar")

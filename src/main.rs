@@ -15,6 +15,7 @@ mod cpuset;
 mod proccache;
 mod common;
 mod rule_match;
+mod inotify;
 
 use config::*;
 use cpuset::CpuSet;
@@ -40,11 +41,13 @@ fn comm_str(comm: &[u8; 16]) -> String {
 
 /// eBPF 模式: 应用亲和性并写 APPLIED_MAP，返回 true 表示 tid 已退出
 fn event_affinity_apply(tid: i32, cpus: &CpuSet, cpuset_dir: &str, cfg: &AppConfig, bpf_state: &mut bpf::BpfCtx) -> bool {
-    let dead = process::affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
-    if !dead {
-        bpf::applied_set(bpf_state, tid, cpus.bits[0]);
+    match process::affinity_set(tid, cpus, cpuset_dir, &cfg.topo) {
+        process::AffinityResult::Dead => true,
+        _ => {
+            bpf::applied_set(bpf_state, tid, cpus.bits[0]);
+            false
+        }
     }
-    dead
 }
 
 /// eBPF 模式: 统一事件处理 (pkg 反查 → task_apply)
@@ -107,7 +110,7 @@ fn full_scan(cfg: &AppConfig, pc: &mut proccache::ProcCache, bpf_state: &mut bpf
         let interested = cfg.pkg_set.contains(&pkg) || cfg.pkg_set.contains(base_pkg)
             || cfg.wild.iter().any(|w| fnmatch(w, &pkg));
         if !interested { return None; }
-        let htr = cfg.pkg_has_thread_rules(&pkg);
+        let htr = cfg.pkg_has_thread_rules(base_pkg);
         Some((pid, pkg, htr))
     }).collect();
 
@@ -191,7 +194,7 @@ fn proc_cache_sync(state: &mut ProcState, cfg: &AppConfig) -> bool {
             let interested = cfg.pkg_set.contains(&pkg) || cfg.pkg_set.contains(base_pkg)
                 || cfg.wild.iter().any(|w| fnmatch(w, &pkg));
             if !interested { continue; }
-            let htr = cfg.pkg_has_thread_rules(&pkg);
+            let htr = cfg.pkg_has_thread_rules(base_pkg);
             let Some(tids) = process::task_tids(pid) else { continue };
 
             let mut any = false;
@@ -305,28 +308,15 @@ fn main() {
     info!("mode: {}", if bpf_state.ok { "eBPF event-driven" } else { "proc polling" });
 
     // inotify 配置文件监听
-    let mut inotify_fd = init_inotify(&config_path);
+    let mut inotify_fd = inotify::init(&config_path);
     let mut last_reload = Instant::now() - Duration::from_secs(10);
 
     loop {
         // 配置热加载检测 (每轮, 5s debounce 防重复触发)
         let mut config_changed = false;
-        if last_reload.elapsed() >= Duration::from_secs(5) {
-            if let Some(ev) = read_inotify(inotify_fd) {
-                if ev == 1 || ev == 2 {
-                    config_changed = hot_reload(&config_path, &mut cfg);
-                    last_reload = Instant::now();
-                    if ev == 2 { rewatch_inotify(&config_path, &mut inotify_fd); }
-                }
-            }
-            if !config_changed && inotify_fd < 0 {
-                if let Ok(mt) = fs::metadata(&config_path).and_then(|m| m.modified()) {
-                    if mt > cfg.mtime {
-                        config_changed = hot_reload(&config_path, &mut cfg);
-                        last_reload = Instant::now();
-                    }
-                }
-            }
+        if inotify::check_changed(&config_path, &mut inotify_fd, &mut last_reload, &cfg.mtime) {
+            config_changed = hot_reload(&config_path, &mut cfg);
+            last_reload = Instant::now();
         }
 
         if bpf_state.ok {
@@ -404,57 +394,5 @@ fn main() {
 
             std::thread::sleep(Duration::from_secs(interval));
         }
-    }
-}
-
-fn init_inotify(path: &str) -> i32 {
-    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-    if fd < 0 { return -1; }
-    let cpath = match std::ffi::CString::new(path) {
-        Ok(c) => c,
-        Err(_) => { unsafe { libc::close(fd); } return -1; }
-    };
-    let wd = unsafe {
-        libc::inotify_add_watch(fd, cpath.as_ptr(),
-            libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF)
-    };
-    if wd < 0 { unsafe { libc::close(fd); } return -1; }
-    info!("inotify: watching config (fd={})", fd);
-    fd
-}
-
-fn read_inotify(fd: i32) -> Option<u8> {
-    if fd < 0 { return None; }
-    let mut buf = [0u8; 1024];
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n <= 0 { return None; }
-    let hdr = std::mem::size_of::<libc::inotify_event>();
-    let mut off = 0usize;
-    let mut reload = false;
-    let mut rewatch = false;
-    while off + hdr <= n as usize {
-        let ev = unsafe { &*(buf.as_ptr().add(off) as *const libc::inotify_event) };
-        if ev.mask & libc::IN_CLOSE_WRITE != 0 { reload = true; }
-        if ev.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 { reload = true; rewatch = true; }
-        off += hdr + ev.len as usize;
-    }
-    if reload { Some(if rewatch { 2 } else { 1 }) } else { None }
-}
-
-fn rewatch_inotify(path: &str, fd: &mut i32) {
-    if *fd < 0 { return; }
-    let cpath = match std::ffi::CString::new(path) {
-        Ok(c) => c, Err(_) => return,
-    };
-    let wd = unsafe {
-        libc::inotify_add_watch(*fd, cpath.as_ptr(),
-            libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF)
-    };
-    if wd < 0 {
-        unsafe { libc::close(*fd); }
-        *fd = -1;
-        warn!("inotify: register failed, fallback to mtime polling");
-    } else {
-        info!("inotify: re-registered");
     }
 }
