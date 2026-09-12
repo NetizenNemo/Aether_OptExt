@@ -99,6 +99,8 @@ Magisk / KernelSU 中刷入 `out/Aether-OptExt_*.zip` 即可。
 
 - `features.ebpf` — 启用 eBPF 加速（需内核支持）
 - `features.auto-for-none` — 启用自动分配缓存
+- `features.foreground` — 前台感知（默认 true）：缓存后台进程（`oom_score_adj >= 900`）自动收缩到能效核，回前台恢复配置目标；仅作用于包级 `other`，线程规则不受影响
+- `features.load_aware` — 动态负载感知（默认 true）：按 `/proc/{tid}/stat` 的 tick 增量实测线程占用率，高负载并入超大核、空闲收缩到能效核，仅作用于包级 `other`
 - `other` — 该应用所有线程的默认绑核
 - `comm` — 按线程名匹配的绑核规则（支持 `*` 通配符）
 

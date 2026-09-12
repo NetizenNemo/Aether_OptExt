@@ -64,6 +64,10 @@ pub struct AppConfig {
     pub topo: crate::cpuset::CpuTopology,
     /// asoul 兼容豁免集合：检测到 asoul 模块时，名单内包名完全不干扰
     pub asoul_ignore: HashSet<String>,
+    /// 前台感知：缓存后台进程（oom_score_adj>=900）收缩到 e_core，回前台自动恢复
+    pub foreground_aware: bool,
+    /// 动态负载感知：按 /proc/{tid}/stat tick 增量对包级 fallback 线程升降档
+    pub load_aware: bool,
 }
 
 /// 检测 asoul 模块是否安装（其守护进程以 /data/adb/asoul_affinity_opt 为根）
@@ -102,6 +106,8 @@ impl AppConfig {
         }
 
         let ebpf = root["features"]["ebpf"].as_bool().unwrap_or(false);
+        let foreground_aware = root["features"]["foreground"].as_bool().unwrap_or(true);
+        let load_aware = root["features"]["load_aware"].as_bool().unwrap_or(true);
         let entries = if root.is_array() { &root } else { &root["rules"] };
         if !entries.is_array() { return None; }
 
@@ -145,6 +151,7 @@ impl AppConfig {
         let mut cfg = AppConfig {
             rules, pkg_set, wild, mtime: mt, ebpf, topo: topo.clone(),
             asoul_ignore: HashSet::new(),
+            foreground_aware, load_aware,
         };
         cfg.apply_asoul_ignore();
         Some(cfg)

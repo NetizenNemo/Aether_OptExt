@@ -37,6 +37,15 @@ impl CpuSet {
         }
     }
 
+    /// self ∩ other（按位与）
+    pub fn intersection(&self, other: &CpuSet) -> CpuSet {
+        let mut r = CpuSet::new();
+        for (i, (&a, &b)) in self.bits.iter().zip(other.bits.iter()).enumerate() {
+            r.bits[i] = a & b;
+        }
+        r
+    }
+
     /// 从 "0-3,6-7" 解析
     pub fn from_range(spec: &str) -> CpuSet {
         parse_cpu_ranges(spec, None)

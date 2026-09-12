@@ -125,3 +125,53 @@ pub fn tid_comm(tid: i32) -> Option<String> {
     let s = comm.trim().to_string();
     if s.is_empty() { None } else { Some(s) }
 }
+
+/// 读 /proc/{pid}/oom_score_adj，用于前台感知
+/// 返回 Some(oom_score_adj) 或 None
+pub fn read_oom_score_adj(pid: i32) -> Option<i32> {
+    let s = fs::read_to_string(format!("/proc/{}/oom_score_adj", pid)).ok()?;
+    s.trim().parse().ok()
+}
+
+/// 判断进程是否处于前台（oom_score_adj <= 0 且非冻结进程）
+/// Android 前台进程 oom_adj 通常为 0 或负值，后台为正数
+#[allow(dead_code)]
+pub fn is_foreground(pid: i32) -> bool {
+    read_oom_score_adj(pid).map_or(false, |adj| adj <= 0)
+}
+
+/// 判断进程是否为缓存后台（oom_score_adj >= 900，Android cached app 阈值）
+pub fn is_background(pid: i32) -> bool {
+    read_oom_score_adj(pid).map_or(false, |adj| adj >= 900)
+}
+
+/// 读 /proc/{tid}/stat 的 utime+stime，用于动态负载感知
+/// 返回 (utime+stime, 上次采集时间点)，None 表示读取失败
+#[allow(dead_code)]
+pub fn read_thread_cpu_time(tid: i32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{}/stat", tid)).ok()?;
+    // 格式: pid (comm) state ppid ... utime(14) stime(15) ...
+    // comm 可能含空格和括号，需跳过第一个 ) 后再 split
+    let after_comm = stat.find(')').map(|i| &stat[i + 2..])?;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    if fields.len() < 15 { return None; }
+    let utime: u64 = fields[12].parse().ok()?;  // 第14个字段（从state算第13个）
+    let stime: u64 = fields[13].parse().ok()?;
+    Some(utime + stime)
+}
+
+/// 线程 CPU 负载等级（0~10），基于 stat 的 utime+stime 短周期差值
+/// 与 config::cache::est_load 的静态名推不同，此处反映真实运行时负载
+#[allow(dead_code)]
+pub fn load_level(current_cpu_ticks: u64, prev_cpu_ticks: u64, elapsed_ticks: u64) -> i32 {
+    if elapsed_ticks == 0 { return 0; }
+    let delta = current_cpu_ticks.saturating_sub(prev_cpu_ticks);
+    let ratio = (delta * 100) / elapsed_ticks;  // 占用百分比
+    match ratio {
+        0..=5   => 1,
+        6..=15  => 3,
+        16..=35 => 5,
+        36..=60 => 7,
+        _       => 10,
+    }
+}

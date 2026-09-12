@@ -349,7 +349,7 @@ fn main() {
 
             // 定期纠正亲和性 (每 3*interval 秒)
             if affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
-                let dead_tids = proc_state.cache.affinity_sync(&cfg.topo);
+                let dead_tids = proc_state.cache.affinity_sync(&cfg);
                 for tid in dead_tids {
                     bpf::applied_del(&mut bpf_state, tid);
                 }
@@ -366,7 +366,7 @@ fn main() {
 
             // 定期纠正亲和性 (每 3*interval 秒 或 进程数变化时)
             if proc_state.force_affinity || affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
-                let _dead = proc_state.cache.affinity_sync(&cfg.topo);
+                let _dead = proc_state.cache.affinity_sync(&cfg);
                 proc_state.force_affinity = false;
                 affinity_deadline = Instant::now();
             }

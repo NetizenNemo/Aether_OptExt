@@ -51,36 +51,51 @@ def gen_ebpf_bytecode():
     warn("eBPF: WSL 不可用, 保留现有 ebpf_target.o")
 
 
+def ndk_candidates(base):
+    """给定路径，产出其下所有可能的 NDK 根目录。
+    兼容三种布局：NDK 本体、SDK(ndk/*, ndk-bundle/*)、解压父目录(*/ 一层子目录)"""
+    base = Path(base)
+    if not base.exists():
+        return
+    if (base / "toolchains" / "llvm" / "prebuilt").exists():
+        yield base
+        return
+    seen = set()
+    for pat in ["ndk/*", "ndk-bundle/*", "*"]:
+        for p in sorted(base.glob(pat), reverse=True):
+            if p in seen or not p.is_dir():
+                continue
+            seen.add(p)
+            if (p / "toolchains" / "llvm" / "prebuilt").exists():
+                yield p
+
+def pick_linker(ndk_dir):
+    """从 NDK 目录解析 host tag 与 aarch64 linker，返回 (host_tag, linker) 或 None"""
+    for tag in ["windows-x86_64", "linux-x86_64", "darwin-x86_64", "darwin-aarch64"]:
+        tc = ndk_dir / "toolchains" / "llvm" / "prebuilt" / tag
+        if not tc.exists():
+            continue
+        linker = tc / "bin" / "aarch64-linux-android21-clang"
+        if sys.platform == "win32":
+            linker = linker.with_suffix(".cmd")
+        if linker.exists():
+            return tag, linker
+    return None
+
 def find_ndk():
     """找 NDK 目录用于 Rust 交叉编译。返回 (ndk_dir, host_tag, linker) 或 (None, None, None)"""
-    # 环境变量优先
-    for var in ["ANDROID_NDK_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT"]:
-        base = os.environ.get(var)
-        if not base: continue
-        base = Path(base)
-        ndk_dir = base if (base / "toolchains/llvm/prebuilt").exists() else \
-                  next(iter(sorted(base.glob("ndk/*"), reverse=True)), None)
-        if not ndk_dir: ndk_dir = next(iter(sorted(base.glob("ndk-bundle/*"), reverse=True)), None)
-        if not ndk_dir: continue
-        for tag in ["windows-x86_64", "linux-x86_64", "darwin-x86_64", "darwin-aarch64"]:
-            tc = ndk_dir / "toolchains/llvm/prebuilt" / tag
-            if not tc.exists(): continue
-            linker = tc / "bin" / "aarch64-linux-android21-clang"
-            if sys.platform == "win32": linker = linker.with_suffix(".cmd")
-            if linker.exists(): info(f"NDK: {ndk_dir}"); return ndk_dir, tag, linker
+    bases = [os.environ.get(v) for v in ["ANDROID_NDK_HOME", "ANDROID_NDK", "NDK_HOME", "NDK_ROOT",
+                                        "ANDROID_HOME", "ANDROID_SDK_ROOT"]]
     # 常见路径兜底
-    for base_str in [str(Path.home() / "Android/Sdk"), str(Path.home() / "AppData/Local/Android/Sdk")]:
-        base = Path(base_str)
-        if not base.exists(): continue
-        ndk_dir = next(iter(sorted(base.glob("ndk/*"), reverse=True)), None)
-        if not ndk_dir: ndk_dir = next(iter(sorted(base.glob("ndk-bundle/*"), reverse=True)), None)
-        if not ndk_dir: continue
-        for tag in ["windows-x86_64", "linux-x86_64", "darwin-x86_64", "darwin-aarch64"]:
-            tc = ndk_dir / "toolchains/llvm/prebuilt" / tag
-            if not tc.exists(): continue
-            linker = tc / "bin" / "aarch64-linux-android21-clang"
-            if sys.platform == "win32": linker = linker.with_suffix(".cmd")
-            if linker.exists(): info(f"NDK: {ndk_dir}"); return ndk_dir, tag, linker
+    bases += [str(Path.home() / "Android/Sdk"), str(Path.home() / "AppData/Local/Android/Sdk")]
+    bases += ["D:/android-ndk-r27d-windows", "C:/android-ndk", "D:/android-ndk"]
+
+    for base_str in filter(None, bases):
+        for ndk_dir in ndk_candidates(base_str):
+            picked = pick_linker(ndk_dir)
+            if picked:
+                info(f"NDK: {ndk_dir}")
+                return ndk_dir, picked[0], picked[1]
     warn("无 NDK"); return None, None, None
 
 def build(ndk_info):
