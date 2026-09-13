@@ -57,7 +57,7 @@ pub fn thread_affinity(pkg: &str, thread: &str, cfg: &AppConfig, topo: &CpuTopol
     if cpus.count() == 0 {
         if cfg.pkg_has_thread_rules(pkg) {
             return Some(AffinityResult {
-                cpus: topo.present_cpus.clone(),
+                cpus: topo.present_cpus,
                 cpuset_dir: String::new(),
                 is_thread_rule: false,
             });

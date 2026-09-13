@@ -59,15 +59,31 @@ pub fn scan_unknown(set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String,
 /// 应用绑核：sched_getaffinity 短路 → sched_setaffinity → cpuset 写入
 /// 返回 AffinityResult 三态：Ok=成功, Dead=线程退出, Failed=真正失败
 pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpuset::CpuTopology) -> AffinityResult {
+    // thermal 可能下线大核：目标掩码若含离线核则裁剪到在线核，避免 EINVAL；
+    // 发生裁剪时 cpuset 目录按裁剪后集合重算，未裁剪则保留原目录
+    let clipped = topo.clip_online(cpus);
+    let dir_owned: Option<String> = if clipped == *cpus {
+        None
+    } else {
+        Some(if topo.cpuset_enabled {
+            crate::cpuset::ensure_cpuset_dir(&clipped, topo)
+        } else {
+            String::new()
+        })
+    };
+    let (target, dir): (&CpuSet, &str) = match &dir_owned {
+        Some(d) => (&clipped, d),
+        None => (cpus, cpuset_dir),
+    };
     // sched_getaffinity 短路：已符合目标零开销返回
     if let Some(curr) = CpuSet::get_affinity(tid) {
-        if curr == *cpus { return AffinityResult::Ok; }
+        if curr == *target { return AffinityResult::Ok; }
     }
 
     let mut tasks_path: Option<String> = None;
     if topo.cpuset_enabled {
         let tid_str = format!("{}\n", tid);
-        let tasks_path_str = if cpuset_dir.is_empty() {
+        let tasks_path_str = if dir.is_empty() {
             format!("{}/tasks", crate::common::base_cpuset())
         } else {
             format!("{}/{}/tasks", crate::common::base_cpuset(), cpuset_dir)
@@ -79,7 +95,7 @@ pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpu
         tasks_path = Some(tasks_path_str);
     }
 
-    if let Err(e) = cpus.set_affinity(tid) {
+    if let Err(e) = target.set_affinity(tid) {
         if e.raw_os_error() == Some(3) { return AffinityResult::Dead; }  // ESRCH: 线程已退出
         // EINVAL: 迁移可能未生效，重写 tasks 再重试一次（双保险）
         if e.raw_os_error() == Some(22) && topo.cpuset_enabled {
@@ -89,17 +105,17 @@ pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpu
                     .open(p)
                     .and_then(|mut f| f.write_all(format!("{}\n", tid).as_bytes()));
             }
-            if let Err(e2) = cpus.set_affinity(tid) {
+            if let Err(e2) = target.set_affinity(tid) {
                 if e2.raw_os_error() == Some(3) { return AffinityResult::Dead; }
                 crate::error!("[E] bind failed (retry) tid={} cpus={} ({})", tid,
-                    cpus.to_range_string(), e2);
+                    target.to_range_string(), e2);
                 return AffinityResult::Failed;
             }
             return AffinityResult::Ok;  // 重试成功
         }
         let mut seen = FAILED_ONCE.lock().unwrap_or_else(|p| p.into_inner());
-        if seen.insert((tid, cpus.to_range_string())) {
-            crate::info!("绑核失败 tid={} cpus={} ({})", tid, cpus.to_range_string(), e);
+        if seen.insert((tid, target.to_range_string())) {
+            crate::info!("绑核失败 tid={} cpus={} ({})", tid, target.to_range_string(), e);
         }
         return AffinityResult::Failed;
     }

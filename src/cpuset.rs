@@ -223,6 +223,11 @@ pub fn ensure_cpuset_dir(cpus: &CpuSet, topo: &CpuTopology) -> String {
 pub struct CpuTopology {
     pub present_cpus: CpuSet,
     pub present_str: String,
+    /// 当前在线核（present ∩ online），thermal 会临时下线大核，
+    /// 绑定前目标掩码必须裁掉离线核，否则 sched_setaffinity 报 EINVAL。
+    /// clip_online 内部按 ONLINE_REFRESH_MS 节流刷新。
+    online_now: std::cell::Cell<CpuSet>,
+    online_at: std::cell::Cell<u64>,
     pub mems_str: String,
     pub cpuset_enabled: bool,
     pub base_cpuset_fd: RawFd,
@@ -230,6 +235,38 @@ pub struct CpuTopology {
     pub e_core: CpuSet,
     pub p_core: CpuSet,
     pub hp_core: CpuSet,
+}
+
+/// 读取在线核集合并与 present 求交，失败返回 None
+fn read_online_cpus(present: &CpuSet) -> Option<CpuSet> {
+    let s = fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+    let o = parse_cpu_ranges(s.trim(), None);
+    if o.count() == 0 { return None; }
+    Some(o.intersection(present))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+const ONLINE_REFRESH_MS: u64 = 1000;
+
+impl CpuTopology {
+    /// 按在线核裁剪目标掩码（thermal 下线大核时防止 sched_setaffinity EINVAL），
+    /// 裁剪后为空则回退全部在线核。内部 1s 节流刷新，自动跟随 thermal 上/下线。
+    pub fn clip_online(&self, cpus: &CpuSet) -> CpuSet {
+        let now = now_ms();
+        if now >= self.online_at.get() + ONLINE_REFRESH_MS {
+            if let Some(o) = read_online_cpus(&self.present_cpus) {
+                self.online_now.set(o);
+            }
+            self.online_at.set(now);
+        }
+        let online = self.online_now.get();
+        let c = cpus.intersection(&online);
+        if c.count() == 0 { online } else { c }
+    }
 }
 
 /// 按 cpufreq 策略检测核心分层，按最高频率升序分组：首组为 e-core，末组为 hp-core，中间为 p-core
@@ -291,6 +328,8 @@ pub fn init_cpu_topo() -> CpuTopology {
     let mut topo = CpuTopology {
         present_cpus: CpuSet::new(),
         present_str: String::new(),
+        online_now: std::cell::Cell::new(CpuSet::new()),
+        online_at: std::cell::Cell::new(0),
         mems_str: String::new(),
         cpuset_enabled: false,
         base_cpuset_fd: -1,
@@ -303,7 +342,16 @@ pub fn init_cpu_topo() -> CpuTopology {
         topo.present_str = content.trim().to_string();
     }
     topo.present_cpus = parse_cpu_ranges(&topo.present_str, None);
+    let online_str = fs::read_to_string("/sys/devices/system/cpu/online")
+        .map(|s| s.trim().to_string()).unwrap_or_default();
+    let online = {
+        let o = parse_cpu_ranges(&online_str, None);
+        if o.count() == 0 { topo.present_cpus } else { o.intersection(&topo.present_cpus) }
+    };
+    topo.online_now.set(online);
+    topo.online_at.set(now_ms());
     let (e, p, h) = detect_core_types();
+    // 语义分层保留完整检测结果，绑定时刻由 clip_online 动态裁剪（thermal 上下线自适应）
     topo.e_core = e;
     topo.p_core = p;
     topo.hp_core = h;
