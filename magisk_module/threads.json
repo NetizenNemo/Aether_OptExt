@@ -3,7 +3,8 @@
     "ebpf": true,
     "auto-for-none": true,
     "foreground": true,
-    "load_aware": true
+    "load_aware": true,
+    "notify_scheduler": true
   },
   "rules": [
     {

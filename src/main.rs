@@ -39,13 +39,58 @@ fn comm_str(comm: &[u8; 16]) -> String {
     std::str::from_utf8(&comm[..end]).unwrap_or("").trim().to_string()
 }
 
-/// eBPF 模式: 应用亲和性并写 APPLIED_MAP，返回 true 表示 tid 已退出
-fn event_affinity_apply(tid: i32, cpus: &CpuSet, cpuset_dir: &str, cfg: &AppConfig, bpf_state: &mut bpf::BpfCtx) -> bool {
-    match process::affinity_set(tid, cpus, cpuset_dir, &cfg.topo) {
-        process::AffinityResult::Dead => true,
+/// 已通知的 pid → 上次通知时刻(ms)。eBPF FORK 会为每个线程触发一次，
+/// 按 pid 去重才能压住同进程多线程噪音；不同进程交替出现属正常，各自通知一次。
+static FG_HINTED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i32, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 同 pid 通知节流窗口：窗口内重复触发直接跳过
+const FG_HINT_TTL_MS: u64 = 10_000;
+/// 去重表容量上限，超限时清理过期项
+const FG_HINT_CAP: usize = 4096;
+
+/// 通知 Aether Scheduler 可能有前台应用变化（Scheduler 收到后自行 dumpsys 确认）
+/// 信号文件: /sdcard/Android/Aether/fg_hint
+/// 格式: <pkg>:<pid>:<timestamp_ms>
+///
+/// OptExt 只发"有变化"的信号，不判断哪个应用在前台——进程被迁入自建 cpuset 子组后
+/// 不再出现在 top-app/cgroup.procs，Scheduler 的 inotify 监听会失效，故需此旁路通知。
+/// 写盘失败静默忽略，不影响绑核主流程。返回 true 表示实际写入（被节流跳过为 false）
+fn notify_fg_change(pkg: &str, pid: i32) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    {
+        let mut seen = FG_HINTED.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(&t) = seen.get(&pid) {
+            if now.saturating_sub(t) < FG_HINT_TTL_MS {
+                return false;
+            }
+        }
+        if seen.len() > FG_HINT_CAP {
+            seen.retain(|_, &mut t| now.saturating_sub(t) < FG_HINT_TTL_MS);
+        }
+        seen.insert(pid, now);
+    }
+    let _ = std::fs::write(
+        "/sdcard/Android/Aether/fg_hint",
+        format!("{}:{}:{}", pkg, pid, now),
+    );
+    info!("fg_hint: {} ({})", pkg, pid);
+    true
+}
+
+/// eBPF 模式: 应用亲和性并写 APPLIED_MAP，返回 (tid已退出, 生效目标变更)
+fn event_affinity_apply(tid: i32, cpus: &CpuSet, cpuset_dir: &str, cfg: &AppConfig, bpf_state: &mut bpf::BpfCtx)
+    -> (bool, Option<CpuSet>)
+{
+    let (res, eff) = process::affinity_set_ex(tid, cpus, cpuset_dir, &cfg.topo);
+    match res {
+        process::AffinityResult::Dead => (true, None),
         _ => {
             bpf::applied_set(bpf_state, tid, cpus.bits[0]);
-            false
+            (false, eff)
         }
     }
 }
@@ -73,6 +118,16 @@ fn event_dispatch(event: &bpf::EbpfProcEvent, cfg: &AppConfig,
             if tid == pid { pc.pkgs.remove(&pid); }
             pc.task_del(tid);
             bpf::applied_del(bpf_state, tid);
+        }
+        bpf::EVENT_FG => {
+            // 进程被搬入前台 cgroup：读其包名后通知 Scheduler 重查。
+            // 不走 event_apply（前台切换与绑核无关），仅发信号。
+            if cfg.notify_scheduler {
+                if let Some(pkg) = process::read_cmdline(pid) {
+                    let base = pkg.split(':').next().unwrap_or(&pkg);
+                    notify_fg_change(base, pid);
+                }
+            }
         }
         bpf::EVENT_EXEC => {
             pc.pkgs.remove(&pid);
@@ -200,7 +255,7 @@ fn proc_cache_sync(state: &mut ProcState, cfg: &AppConfig) -> bool {
             let mut any = false;
             for tid in tids {
                 let tn = if htr { process::tid_comm(tid).unwrap_or_default() } else { String::new() };
-                if state.cache.task_apply(tid, pid, &pkg, &tn, htr, cfg, true, |_, _, _| false) {
+                if state.cache.task_apply(tid, pid, &pkg, &tn, htr, cfg, true, |_, _, _| (false, None)) {
                     any = true;
                 }
             }

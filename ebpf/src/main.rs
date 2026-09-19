@@ -12,8 +12,10 @@ const EVENT_FORK: u32 = 1;
 const EVENT_EXEC: u32 = 2;
 const EVENT_RENAME: u32 = 3;
 const EVENT_EXIT: u32 = 4;
+const EVENT_FG: u32 = 5;
 
-/// 4 类 tracepoint 字段布局：fork 读 child_pid/child_comm，rename 读 newcomm
+/// 4 类 tracepoint 字段布局：fork 读 child_pid/child_comm，rename 读 newcomm，
+/// cgroup_attach_task 读 dst_id/pid
 /// 用户态解析 format 文件注入的字段偏移，因内核版本设备而异禁止硬编码
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -21,6 +23,8 @@ struct TracepointOffsets {
     fork_child_pid: u32,
     fork_child_comm: u32,
     rename_newcomm: u32,
+    cg_dst_id: u32,
+    cg_pid: u32,
 }
 
 /// 进程事件，布局需与用户态 EbpfProcEvent 一致
@@ -49,6 +53,11 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// 用户态注入的 tracepoint 字段偏移单条 Array 索引 0
 #[map]
 static OFFSETS_MAP: Array<TracepointOffsets> = Array::with_max_entries(1, 0);
+
+/// 前台相关 cgroup kernfs id 白名单（用户态注入 top-app/foreground 的 inode）
+/// 键为 dst_id，命中即视为前台归属变化，用于通知 Aether Scheduler 重查
+#[map]
+static FG_CGROUP_MAP: HashMap<u64, u32> = HashMap::with_max_entries(16, 0);
 
 /// 读取偏移，fork_child_pid 为 0 视为未注入返回 None
 #[inline(always)]
@@ -197,6 +206,40 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
         tid: tid as i32,
         comm: [0u8; 16],
         event_type: EVENT_EXIT,
+    });
+    0
+}
+
+/// 前台归属变化：Android OomAdjuster 切换前台时把进程搬入 top-app/foreground，
+/// 该 tracepoint 记录 dst_id（= cgroup kernfs inode）。命中用户态注入的前台 id
+/// 白名单即上报，供 Aether Scheduler 重查前台——OptExt 把进程迁入自建 cpuset
+/// 子组后，Scheduler 监听的 top-app/cgroup.procs 不再变化，需此旁路信号。
+#[tracepoint(name = "cgroup_attach_task", category = "cgroup")]
+fn cgroup_attach_task(ctx: TracePointContext) -> u32 {
+    let Some(offsets) = offsets_load() else {
+        return 0;
+    };
+    // 偏移未注入（旧内核无该 tracepoint 字段）时静默跳过
+    if offsets.cg_dst_id == 0 || offsets.cg_pid == 0 {
+        return 0;
+    }
+    let dst_id = unsafe { ctx.read_at::<u64>(offsets.cg_dst_id as usize).unwrap_or(0) };
+    if dst_id == 0 {
+        return 0;
+    }
+    if unsafe { FG_CGROUP_MAP.get(&dst_id) }.is_none() {
+        return 0;
+    }
+    let pid = unsafe { ctx.read_at::<i32>(offsets.cg_pid as usize).unwrap_or(0) };
+    if pid <= 0 {
+        return 0;
+    }
+    // comm 由用户态按 pid 读取（tracepoint 的 comm 是写入者 OomAdjuster，非目标进程）
+    submit_event(ProcEvent {
+        pid,
+        tid: pid,
+        comm: [0u8; 16],
+        event_type: EVENT_FG,
     });
     0
 }

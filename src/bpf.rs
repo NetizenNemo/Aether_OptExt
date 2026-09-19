@@ -13,6 +13,8 @@ pub const EVENT_FORK: u32 = 1;
 pub const EVENT_EXEC: u32 = 2;
 pub const EVENT_RENAME: u32 = 3;
 pub const EVENT_EXIT: u32 = 4;
+/// 前台归属变化（进程被搬入 top-app/foreground），用于通知 Aether Scheduler 重查
+pub const EVENT_FG: u32 = 5;
 
 /// eBPF 进程事件，布局与内核态 ProcEvent 一致
 #[repr(C)]
@@ -31,6 +33,9 @@ struct EbpfOffsets {
     fork_child_pid: u32,
     fork_child_comm: u32,
     rename_newcomm: u32,
+    /// cgroup_attach_task 的 dst_id / pid 偏移（0 = 该 tracepoint 不可用）
+    cg_dst_id: u32,
+    cg_pid: u32,
 }
 
 // SAFETY: 全部为 u32 POD 字段
@@ -124,6 +129,8 @@ pub fn probe(enable: bool) -> BpfCtx {
     let exec_ok = attach(&mut bpf, "sched_process_exec", "sched", true);
     let exit_ok = attach(&mut bpf, "sched_process_exit", "sched", true);
     attach(&mut bpf, "task_rename", "task", false); // rename 可选
+    // 前台感知可选：失败仅降级为无 fg_hint 通知，不影响绑核主链路
+    let fg_ok = attach(&mut bpf, "cgroup_attach_task", "cgroup", false);
 
     if !(fork_ok && exec_ok && exit_ok) {
         crate::warn!("[ebpf] required tracepoints failed, fallback to /proc polling");
@@ -148,8 +155,15 @@ pub fn probe(enable: bool) -> BpfCtx {
 
     let reader = thread::spawn(move || ebpf_reader(ring_buf, tx, wakeup_fd));
 
-    crate::info!("[ebpf] ready (exec={} fork={} exit={})", exec_ok, fork_ok, exit_ok);
-    BpfCtx { ok: true, event_rx: rx, bpf: Some(bpf), wakeup_fd, reader_thread: Some(reader) }
+    let mut ctx = BpfCtx { ok: true, event_rx: rx, bpf: Some(bpf), wakeup_fd, reader_thread: Some(reader) };
+    // 注入前台 cgroup id（供 cgroup_attach_task hook 判定）；失败仅失去 fg_hint 能力
+    let fg_n = if fg_ok { fg_cgroup_init(&mut ctx) } else { 0 };
+    if fg_ok && fg_n == 0 {
+        crate::warn!("[ebpf] fg cgroup id inject failed, fg_hint disabled");
+    }
+
+    crate::info!("[ebpf] ready (exec={} fork={} exit={} fg={})", exec_ok, fork_ok, exit_ok, fg_ok);
+    ctx
 }
 
 /// RingBuf 读取线程：epoll 阻塞等待事件，wakeup_fd 用于 Drop 唤醒退出
@@ -250,10 +264,14 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
     let offsets = (|| {
         let fork_fields = tracepoint_parse(root, "sched", "sched_process_fork")?;
         let rename_fields = tracepoint_parse(root, "task", "task_rename")?;
+        // cgroup_attach_task 缺失时置 0，内核态据此跳过前台 hook（不影响绑核主链路）
+        let cg = tracepoint_parse(root, "cgroup", "cgroup_attach_task").unwrap_or_default();
         Some(EbpfOffsets {
             fork_child_pid: *fork_fields.get("child_pid")?,
             fork_child_comm: *fork_fields.get("child_comm")?,
             rename_newcomm: *rename_fields.get("newcomm")?,
+            cg_dst_id: cg.get("dst_id").copied().unwrap_or(0),
+            cg_pid: cg.get("pid").copied().unwrap_or(0),
         })
     })();
     let Some(offsets) = offsets else {
@@ -274,8 +292,9 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
         return false;
     }
 
-    crate::info!("[ebpf] offsets [{}] fork[child_pid={}, child_comm={}] rename[newcomm={}]",
-        root, offsets.fork_child_pid, offsets.fork_child_comm, offsets.rename_newcomm);
+    crate::info!("[ebpf] offsets [{}] fork[child_pid={}, child_comm={}] rename[newcomm={}] cg[dst_id={}, pid={}]",
+        root, offsets.fork_child_pid, offsets.fork_child_comm, offsets.rename_newcomm,
+        offsets.cg_dst_id, offsets.cg_pid);
     true
 }
 
@@ -359,6 +378,39 @@ pub fn applied_clear(ctx: &mut BpfCtx) {
     for k in &keys {
         let _ = m.remove(k);
     }
+}
+
+/// 前台 cgroup 目录：进程被 Android OomAdjuster 搬入此分组即视为前台切换。
+/// 只监听 top-app —— 它是 Android 认定的真正前台（顶层窗口所在）。
+/// foreground 含大量"可见但非顶层"进程（实测切一次设置就产生 4 条无关事件：
+/// ui.cloudservice / com.xiaomi.ab / htmlviewer / coolapk），会淹没真实信号。
+const FG_CGROUP_DIRS: &[&str] = &[
+    "/dev/cpuset/top-app",
+];
+
+/// 注入前台 cgroup kernfs id 到 FG_CGROUP_MAP。
+/// tracepoint 的 dst_id 即 cgroup 目录 inode（实测 /dev/cpuset/top-app inode == dst_id），
+/// 故用户态 stat 一次目录即可，内核态无需解析路径字符串。
+pub fn fg_cgroup_init(ctx: &mut BpfCtx) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let bpf = match &mut ctx.bpf { Some(b) => b, None => return 0 };
+    let Some(map) = bpf.map_mut("FG_CGROUP_MAP") else { return 0 };
+    let Ok(mut m) = BpfHashMap::<_, u64, u32>::try_from(map) else { return 0 };
+
+    let old: Vec<u64> = m.keys().filter_map(|r| r.ok()).collect();
+    for k in &old { let _ = m.remove(k); }
+
+    let mut n = 0;
+    for dir in FG_CGROUP_DIRS {
+        if let Ok(md) = std::fs::metadata(dir) {
+            let ino = md.ino();
+            if m.insert(&ino, 1, 0).is_ok() {
+                crate::info!("[ebpf] fg cgroup: {} -> {}", dir, ino);
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// 从 comm 16 字节反查包名（与 BPF 双键逻辑一致：精确优先，其次前缀/后缀）

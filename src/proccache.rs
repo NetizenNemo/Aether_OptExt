@@ -16,7 +16,15 @@ pub struct TaskEntry {
     pub base_cpus: CpuSet,
     /// 上次采样的 utime+stime（动态负载感知用，0=未初始化）
     pub prev_ticks: u64,
+    /// 内核实际允许的上限（在线核/cpuset effective 收缩后的生效集）。
+    /// 非空时目标向其收敛，避免每周期重复撞 EINVAL；TTL 到期清空以尝试重新扩张。
+    cap: CpuSet,
+    /// cap 已持续周期数，超过 CAP_TTL 清空重探
+    cap_age: u8,
 }
+
+/// cap 存活周期数：到期后重探一次，保证核/分组恢复时能扩回配置目标
+const CAP_TTL: u8 = 3;
 
 /// 双模式共用进程缓存：eBPF 事件驱动增量维护，proc 模式触发全量重建
 pub struct ProcCache {
@@ -65,7 +73,7 @@ impl ProcCache {
     /// 新结果走 fallback 时保护已有线程规则绑定，防止临时改名降级
     pub fn task_apply<F>(&mut self, tid: i32, pid: i32, pkg: &str, comm: &str,
         has_thread_rules: bool, cfg: &config::AppConfig, trust_comm: bool, apply_fn: F) -> bool
-    where F: FnOnce(i32, &CpuSet, &str) -> bool
+    where F: FnOnce(i32, &CpuSet, &str) -> (bool, Option<CpuSet>)
     {
         let thread_name = if has_thread_rules && trust_comm { comm } else { "" };
         let Some(result) = crate::rule_match::thread_affinity(pkg, thread_name, cfg, &cfg.topo) else {
@@ -81,20 +89,38 @@ impl ProcCache {
             }
         }
 
+        // 已绑定但目标被内核限缩时沿用旧 cap，避免反复重探
+        let keep_cap = self.tasks.get(&tid).map(|t| t.cap).unwrap_or_default();
+
         self.tasks.remove(&tid);
-        let dead = apply_fn(tid, &result.cpus, &result.cpuset_dir);
+        let (dead, eff) = apply_fn(tid, &result.cpus, &result.cpuset_dir);
         if dead {
             return false;
         }
 
+        // eff = 内核实际生效集；与配置目标不同则记为 cap。
+        // cpuset_dir 必须与生效集同步重算，否则下周期会把线程迁回原分组再撞 EINVAL。
+        let (cpus, cap, dir) = match eff {
+            Some(e) => {
+                let d = if cfg.topo.cpuset_enabled {
+                    crate::cpuset::ensure_cpuset_dir(&e, &cfg.topo)
+                } else {
+                    String::new()
+                };
+                (e.clone(), e, d)
+            }
+            None => (result.cpus, keep_cap, result.cpuset_dir),
+        };
         self.tasks.insert(tid, TaskEntry {
             pid,
-            cpus: result.cpus,
-            cpuset_dir: result.cpuset_dir,
+            cpus,
+            cpuset_dir: dir,
             is_thread_rule: result.is_thread_rule,
             failed: false,
             base_cpus: result.cpus,
             prev_ticks: 0,
+            cap,
+            cap_age: 0,
         });
         true
     }
@@ -106,11 +132,19 @@ impl ProcCache {
         let topo = &cfg.topo;
         if e.is_thread_rule { return; }
 
+        // 内核限缩过的目标优先（后台降档同样受其约束）
+        let clamp = |e: &TaskEntry, want: CpuSet| -> CpuSet {
+            if e.cap.count() == 0 { return want; }
+            let c = want.intersection(&e.cap);
+            if c.count() == 0 { e.cap } else { c }
+        };
+
         // 后台降档
         if cfg.foreground_aware && is_bg {
-            if topo.e_core.count() > 0 && topo.e_core != e.cpus {
-                e.cpus = topo.e_core;
-                e.cpuset_dir = ensure_cpuset_dir(&topo.e_core, topo);
+            let want = clamp(e, topo.e_core);
+            if want.count() > 0 && want != e.cpus {
+                e.cpus = want;
+                e.cpuset_dir = ensure_cpuset_dir(&want, topo);
             }
             return;
         }
@@ -135,6 +169,7 @@ impl ProcCache {
             }
         }
 
+        let desired = clamp(e, desired);
         if desired != e.cpus {
             e.cpus = desired;
             e.cpuset_dir = ensure_cpuset_dir(&desired, topo);
@@ -166,10 +201,33 @@ impl ProcCache {
             if e.failed { continue; }  // 上次失败（cpuset 限制），跳过无效重试
             let is_bg = bg_cache.get(&e.pid).copied().unwrap_or(false);
             Self::adjust_target(*tid, e, cfg, elapsed_ticks, is_bg);
-            match process::affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
+            let (res, eff) = process::affinity_set_ex(*tid, &e.cpus, &e.cpuset_dir, topo);
+            match res {
                 process::AffinityResult::Dead => dead_tids.push(*tid),
                 process::AffinityResult::Failed => e.failed = true,
                 process::AffinityResult::Ok => {}  // 成功，不标记失败
+            }
+            // 目标被内核限缩：记录 cap 并按生效集更新，后续周期零开销短路
+            if let Some(eff) = eff {
+                e.cpus = eff.clone();
+                e.cpuset_dir = if topo.cpuset_enabled {
+                    ensure_cpuset_dir(&eff, topo)
+                } else {
+                    String::new()
+                };
+                e.cap = eff;
+                e.cap_age = 0;
+            } else if e.cap.count() > 0 {
+                // 无新的限缩信息：cap 到期则清空重探，使核恢复后能扩回配置目标
+                e.cap_age = e.cap_age.saturating_add(1);
+                if e.cap_age > CAP_TTL {
+                    // 重探：清空 cap 并连同分组一起回到配置目标，
+                    // 否则线程会滞留在受限分组内继续撞 EINVAL
+                    e.cap = CpuSet::new();
+                    e.cap_age = 0;
+                    e.cpus = e.base_cpus;
+                    e.cpuset_dir = ensure_cpuset_dir(&e.base_cpus, topo);
+                }
             }
         }
         for tid in &dead_tids {

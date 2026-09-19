@@ -136,9 +136,11 @@ def package():
     ver = now.strftime("%m%d-Release")
     vc = int(now.strftime("%y%m%d"))
     prop = MODULE_DIR / "module.prop"
+    # 必须显式指定 UTF-8：Windows 上 write_text 默认 GBK，会把中文描述写成乱码
     prop.write_text(
         f"id=aether-optext\nname=Aether OptExt\nversion={ver}\nversionCode={vc}\nauthor=NekoNemo\n"
-        "description=Aether OptExt - Android CPU affinity optimizer\n"
+        "description=一个使用Rust开发的Android 应用/游戏线程 CPU 亲和性优化工具 Feedback: 1028546498\n",
+        encoding="utf-8", newline="\n",
     )
 
     for f in MODULE_DIR.glob("**/*"):

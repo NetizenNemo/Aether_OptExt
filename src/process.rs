@@ -56,70 +56,109 @@ pub fn scan_unknown(set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String,
     result
 }
 
-/// 应用绑核：sched_getaffinity 短路 → sched_setaffinity → cpuset 写入
-/// 返回 AffinityResult 三态：Ok=成功, Dead=线程退出, Failed=真正失败
-pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpuset::CpuTopology) -> AffinityResult {
-    // thermal 可能下线大核：目标掩码若含离线核则裁剪到在线核，避免 EINVAL；
-    // 发生裁剪时 cpuset 目录按裁剪后集合重算，未裁剪则保留原目录
-    let clipped = topo.clip_online(cpus);
-    let dir_owned: Option<String> = if clipped == *cpus {
-        None
+/// 读 /proc/{tid}/status 的 Cpus_allowed_list —— 内核视角该任务真实可用核
+/// (= cpu online ∩ 所在各级 cpuset 的 effective_cpus)，thermal 限核时最权威
+pub fn read_allowed_cpus(tid: i32) -> Option<CpuSet> {
+    let st = fs::read_to_string(format!("/proc/{}/status", tid)).ok()?;
+    for line in st.lines() {
+        if let Some(rest) = line.strip_prefix("Cpus_allowed_list:") {
+            let set = crate::cpuset::parse_cpu_ranges(rest.trim(), None);
+            if set.count() > 0 { return Some(set); }
+        }
+    }
+    None
+}
+
+/// 将 tid 写入 cpuset 分组 tasks（dir 为空写 BASE_CPUSET 根），返回路径
+fn write_cpuset_tasks(tid: i32, dir: &str, topo: &crate::cpuset::CpuTopology) -> Option<String> {
+    if !topo.cpuset_enabled { return None; }
+    let tasks_path = if dir.is_empty() {
+        format!("{}/tasks", crate::common::base_cpuset())
     } else {
+        format!("{}/{}/tasks", crate::common::base_cpuset(), dir)
+    };
+    let _ = fs::OpenOptions::new()
+        .append(true)
+        .open(&tasks_path)
+        .and_then(|mut f| f.write_all(format!("{}
+", tid).as_bytes()));
+    Some(tasks_path)
+}
+
+fn log_bind_fail(tid: i32, cpus: &CpuSet, e: &std::io::Error) {
+    let mut seen = FAILED_ONCE.lock().unwrap_or_else(|p| p.into_inner());
+    if seen.insert((tid, cpus.to_range_string())) {
+        crate::info!("绑核失败 tid={} cpus={} ({})", tid, cpus.to_range_string(), e);
+    }
+}
+
+/// 应用绑核（兼容包装，丢弃有效集回传）
+#[allow(dead_code)]
+pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpuset::CpuTopology) -> AffinityResult {
+    affinity_set_ex(tid, cpus, cpuset_dir, topo).0
+}
+
+/// 应用绑核并回传实际生效目标。生效集与请求目标不同（在线核裁剪，或 EINVAL 后
+/// 按 Cpus_allowed_list 收缩）时返回 Some，供调用方回写缓存，避免每周期重复重试。
+pub fn affinity_set_ex(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpuset::CpuTopology)
+    -> (AffinityResult, Option<CpuSet>)
+{
+    // 快速路径：目标含离线核则裁剪到在线核，裁剪发生时分组按新集合重算
+    let clipped = topo.clip_online(cpus);
+    let fast_clip = clipped != *cpus;
+    let dir_owned: Option<String> = if fast_clip {
         Some(if topo.cpuset_enabled {
             crate::cpuset::ensure_cpuset_dir(&clipped, topo)
         } else {
             String::new()
         })
+    } else {
+        None
     };
     let (target, dir): (&CpuSet, &str) = match &dir_owned {
         Some(d) => (&clipped, d),
         None => (cpus, cpuset_dir),
     };
+    let report = |eff: &CpuSet| if *eff != *cpus { Some(eff.clone()) } else { None };
+
     // sched_getaffinity 短路：已符合目标零开销返回
     if let Some(curr) = CpuSet::get_affinity(tid) {
-        if curr == *target { return AffinityResult::Ok; }
+        if curr == *target {
+            return (AffinityResult::Ok, report(target));
+        }
     }
 
-    let mut tasks_path: Option<String> = None;
-    if topo.cpuset_enabled {
-        let tid_str = format!("{}\n", tid);
-        let tasks_path_str = if dir.is_empty() {
-            format!("{}/tasks", crate::common::base_cpuset())
-        } else {
-            format!("{}/{}/tasks", crate::common::base_cpuset(), cpuset_dir)
-        };
-        let _ = fs::OpenOptions::new()
-            .append(true)
-            .open(&tasks_path_str)
-            .and_then(|mut f| f.write_all(tid_str.as_bytes()));
-        tasks_path = Some(tasks_path_str);
-    }
+    write_cpuset_tasks(tid, dir, topo);
 
     if let Err(e) = target.set_affinity(tid) {
-        if e.raw_os_error() == Some(3) { return AffinityResult::Dead; }  // ESRCH: 线程已退出
-        // EINVAL: 迁移可能未生效，重写 tasks 再重试一次（双保险）
-        if e.raw_os_error() == Some(22) && topo.cpuset_enabled {
-            if let Some(p) = &tasks_path {
-                let _ = fs::OpenOptions::new()
-                    .append(true)
-                    .open(p)
-                    .and_then(|mut f| f.write_all(format!("{}\n", tid).as_bytes()));
+        if e.raw_os_error() == Some(3) { return (AffinityResult::Dead, None); }  // ESRCH: 线程已退出
+        if e.raw_os_error() == Some(22) {
+            // EINVAL：内核拒绝（核被 hotplug 下线，或 cpuset effective 被 thermal 收缩）。
+            // 以该任务真实可用核（Cpus_allowed_list = online ∩ 各级 cpuset effective）收缩后重试。
+            if let Some(allowed) = read_allowed_cpus(tid) {
+                let mut eff = target.intersection(&allowed);
+                if eff.count() == 0 { eff = allowed; }
+                let eff_dir = if topo.cpuset_enabled {
+                    crate::cpuset::ensure_cpuset_dir(&eff, topo)
+                } else {
+                    String::new()
+                };
+                write_cpuset_tasks(tid, &eff_dir, topo);
+                let r = report(&eff);
+                return match eff.set_affinity(tid) {
+                    Ok(()) => (AffinityResult::Ok, r),
+                    Err(e2) if e2.raw_os_error() == Some(3) => (AffinityResult::Dead, None),
+                    Err(e2) => {
+                        log_bind_fail(tid, &eff, &e2);
+                        (AffinityResult::Failed, r)
+                    }
+                };
             }
-            if let Err(e2) = target.set_affinity(tid) {
-                if e2.raw_os_error() == Some(3) { return AffinityResult::Dead; }
-                crate::error!("[E] bind failed (retry) tid={} cpus={} ({})", tid,
-                    target.to_range_string(), e2);
-                return AffinityResult::Failed;
-            }
-            return AffinityResult::Ok;  // 重试成功
         }
-        let mut seen = FAILED_ONCE.lock().unwrap_or_else(|p| p.into_inner());
-        if seen.insert((tid, target.to_range_string())) {
-            crate::info!("绑核失败 tid={} cpus={} ({})", tid, target.to_range_string(), e);
-        }
-        return AffinityResult::Failed;
+        log_bind_fail(tid, target, &e);
+        return (AffinityResult::Failed, report(target));
     }
-    AffinityResult::Ok
+    (AffinityResult::Ok, report(target))
 }
 
 /// 读 /proc/{pid}/cmdline 取包名

@@ -68,6 +68,10 @@ pub struct AppConfig {
     pub foreground_aware: bool,
     /// 动态负载感知：按 /proc/{tid}/stat tick 增量对包级 fallback 线程升降档
     pub load_aware: bool,
+    /// 是否向 Aether Scheduler 发送前台变化信号（默认 true）
+    /// 进程被迁入自建 cpuset 子组后不再出现于 top-app/cgroup.procs，
+    /// Scheduler 的 inotify 监听失效，需此旁路通知其重新查询前台应用
+    pub notify_scheduler: bool,
 }
 
 /// 检测 asoul 模块是否安装（其守护进程以 /data/adb/asoul_affinity_opt 为根）
@@ -108,6 +112,7 @@ impl AppConfig {
         let ebpf = root["features"]["ebpf"].as_bool().unwrap_or(false);
         let foreground_aware = root["features"]["foreground"].as_bool().unwrap_or(true);
         let load_aware = root["features"]["load_aware"].as_bool().unwrap_or(true);
+        let notify_scheduler = root["features"]["notify_scheduler"].as_bool().unwrap_or(true);
         let entries = if root.is_array() { &root } else { &root["rules"] };
         if !entries.is_array() { return None; }
 
@@ -151,7 +156,7 @@ impl AppConfig {
         let mut cfg = AppConfig {
             rules, pkg_set, wild, mtime: mt, ebpf, topo: topo.clone(),
             asoul_ignore: HashSet::new(),
-            foreground_aware, load_aware,
+            foreground_aware, load_aware, notify_scheduler,
         };
         cfg.apply_asoul_ignore();
         Some(cfg)

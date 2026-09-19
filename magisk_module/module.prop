@@ -1,6 +1,6 @@
 id=aether-optext
 name=Aether OptExt
-version=0912-Release
-versionCode=260912
+version=0919-Release
+versionCode=260919
 author=NekoNemo
-description=Aether OptExt - Android CPU affinity optimizer
+description=一个使用Rust开发的Android 应用/游戏线程 CPU 亲和性优化工具 Feedback: 1028546498
