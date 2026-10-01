@@ -4,7 +4,9 @@
     "auto-for-none": true,
     "foreground": true,
     "load_aware": true,
-    "notify_scheduler": true
+    "notify_scheduler": true,
+    "blacklist": [],
+    "render_guard": true
   },
   "rules": [
     {

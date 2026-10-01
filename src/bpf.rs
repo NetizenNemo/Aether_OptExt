@@ -414,6 +414,7 @@ pub fn fg_cgroup_init(ctx: &mut BpfCtx) -> usize {
 }
 
 /// 从 comm 16 字节反查包名（与 BPF 双键逻辑一致：精确优先，其次前缀/后缀）
+/// 黑名单包已在 apply_blacklist 中移出 pkg_set，此处无需重复过滤
 pub fn comm_to_pkg(comm: &str, cfg: &config::AppConfig) -> Option<String> {
     if cfg.pkg_set.contains(comm) {
         return Some(comm.to_string());

@@ -253,6 +253,11 @@ fn now_ms() -> u64 {
 const ONLINE_REFRESH_MS: u64 = 1000;
 
 impl CpuTopology {
+    /// 当前在线核（供 rule_match 等模块做安全裁剪）
+    pub fn online_cpus_public(&self) -> CpuSet {
+        self.online_now.get()
+    }
+
     /// 按在线核裁剪目标掩码（thermal 下线大核时防止 sched_setaffinity EINVAL），
     /// 裁剪后为空则回退全部在线核。内部 1s 节流刷新，自动跟随 thermal 上/下线。
     pub fn clip_online(&self, cpus: &CpuSet) -> CpuSet {

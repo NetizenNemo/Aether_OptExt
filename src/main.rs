@@ -24,7 +24,7 @@ use cpuset::CpuSet;
 fn hot_reload(config_path: &str, cfg: &mut AppConfig) -> bool {
     if let Some(new_cfg) = AppConfig::load(config_path, &cfg.topo) {
         *cfg = new_cfg;
-        cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
+        cfg.merge_cache();
         info!("config reloaded, {} rules", cfg.rules.len());
         true
     } else {
@@ -122,10 +122,13 @@ fn event_dispatch(event: &bpf::EbpfProcEvent, cfg: &AppConfig,
         bpf::EVENT_FG => {
             // 进程被搬入前台 cgroup：读其包名后通知 Scheduler 重查。
             // 不走 event_apply（前台切换与绑核无关），仅发信号。
+            // 黑名单包完全不受控，连带不发信号
             if cfg.notify_scheduler {
                 if let Some(pkg) = process::read_cmdline(pid) {
                     let base = pkg.split(':').next().unwrap_or(&pkg);
-                    notify_fg_change(base, pid);
+                    if !cfg.in_blacklist(base) {
+                        notify_fg_change(base, pid);
+                    }
                 }
             }
         }
@@ -160,8 +163,9 @@ fn full_scan(cfg: &AppConfig, pc: &mut proccache::ProcCache, bpf_state: &mut bpf
     let targets: Vec<(i32, String, bool)> = proc_dir.flatten().filter_map(|entry| {
         let pid = entry.file_name().to_string_lossy().parse::<i32>().ok()?;
         let pkg = process::read_cmdline(pid).or_else(|| process::tid_comm(pid))?;
-        // 包名匹配 (含 :suffix)
+        // 包名匹配 (含 :suffix)；黑名单包直接排除
         let base_pkg = pkg.split(':').next().unwrap_or(&pkg);
+        if cfg.in_blacklist(&pkg) { return None; }
         let interested = cfg.pkg_set.contains(&pkg) || cfg.pkg_set.contains(base_pkg)
             || cfg.wild.iter().any(|w| fnmatch(w, &pkg));
         if !interested { return None; }
@@ -245,6 +249,7 @@ fn proc_cache_sync(state: &mut ProcState, cfg: &AppConfig) -> bool {
 
             let Some(pkg) = process::read_cmdline(pid).or_else(|| process::tid_comm(pid)) else { continue };
             let base_pkg = pkg.split(':').next().unwrap_or(&pkg);
+            if cfg.in_blacklist(&pkg) { continue; }
             if cfg.asoul_ignore.contains(&pkg) || cfg.asoul_ignore.contains(base_pkg) { continue; }
             let interested = cfg.pkg_set.contains(&pkg) || cfg.pkg_set.contains(base_pkg)
                 || cfg.wild.iter().any(|w| fnmatch(w, &pkg));
@@ -314,7 +319,7 @@ fn main() {
     };
     info!("rules loaded: {}", cfg.rules.len());
 
-    cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
+    cfg.merge_cache();
     info!("total rules (with cache): {}", cfg.rules.len());
 
     let (big, mid1, mid2, little, topo) = cpu::detect();
@@ -349,18 +354,24 @@ fn main() {
     let unknown = process::scan_unknown(&cfg.pkg_set, &cfg.wild);
     let new_pkgs: Vec<String> = unknown.iter()
         .filter(|(_, pkg, _)| !config::cache::is_blacklisted(pkg))
+        .filter(|(_, pkg, _)| !cfg.in_blacklist(pkg))
         .filter(|(_, pkg, _)| !cfg.asoul_ignore.contains(pkg))
         .map(|(_, pkg, _)| pkg.clone()).collect();
     if !new_pkgs.is_empty() {
         for pkg in &new_pkgs {
             info!("new app detected: {}", pkg);
         }
-        let n = cache::save_batch(&new_pkgs, &unknown, &big, &mid1, &mid2, &little);
-        cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
+        let n = cache::save_batch(&new_pkgs, &unknown, &big, &mid1, &mid2, &little, &cfg.blacklist);
+        cfg.merge_cache();
         info!("auto-assign done: {} apps (saved {})", new_pkgs.len(), n);
     }
 
     info!("mode: {}", if bpf_state.ok { "eBPF event-driven" } else { "proc polling" });
+
+    // 启动即清扫：把上次运行残留在 OptExt 分组内的黑名单线程释放
+    for tid in proccache::ProcCache::release_blacklisted_orphans(&cfg, &cfg.topo) {
+        bpf::applied_del(&mut bpf_state, tid);
+    }
 
     // inotify 配置文件监听
     let mut inotify_fd = inotify::init(&config_path);
@@ -372,6 +383,11 @@ fn main() {
         if inotify::check_changed(&config_path, &mut inotify_fd, &mut last_reload, &cfg.mtime) {
             config_changed = hot_reload(&config_path, &mut cfg);
             last_reload = Instant::now();
+            // 热加载后：把已迁出的黑名单线程从 OptExt 分组里清出来，
+            // 并同步清理 eBPF APPLIED_MAP（否则其 fork 的后代仍会被上报）
+            for tid in proccache::ProcCache::release_blacklisted_orphans(&cfg, &cfg.topo) {
+                bpf::applied_del(&mut bpf_state, tid);
+            }
         }
 
         if bpf_state.ok {
@@ -435,14 +451,15 @@ fn main() {
                 let u = process::scan_unknown(&cfg.pkg_set, &cfg.wild);
                 let new_pkgs: Vec<String> = u.iter()
                     .filter(|(_, pkg, _)| !config::cache::is_blacklisted(pkg))
+                    .filter(|(_, pkg, _)| !cfg.in_blacklist(pkg))
                     .filter(|(_, pkg, _)| !cfg.asoul_ignore.contains(pkg))
                     .map(|(_, pkg, _)| pkg.clone()).collect();
                 if !new_pkgs.is_empty() {
                     for pkg in &new_pkgs {
                         info!("new app detected: {}", pkg);
                     }
-                    let n = cache::save_batch(&new_pkgs, &u, &big, &mid1, &mid2, &little);
-                    cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
+                    let n = cache::save_batch(&new_pkgs, &u, &big, &mid1, &mid2, &little, &cfg.blacklist);
+                    cfg.merge_cache();
                     info!("cache updated ({} new apps)", n);
                 }
             }

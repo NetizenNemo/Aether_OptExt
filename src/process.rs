@@ -161,6 +161,51 @@ pub fn affinity_set_ex(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::
     (AffinityResult::Ok, report(target))
 }
 
+/// 读线程所属进程的 Tgid（主线程 pid），失败返回 None
+pub fn tid_tgid(tid: i32) -> Option<i32> {
+    let st = fs::read_to_string(format!("/proc/{}/status", tid)).ok()?;
+    for line in st.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// 按 oom_score_adj 判定线程应回归的系统分组后缀（模拟系统原本的归属）
+fn release_group_suffix(adj: i32) -> &'static str {
+    if adj <= 0 {
+        "/top-app/tasks"
+    } else if adj >= 900 {
+        "/background/tasks"
+    } else {
+        "/foreground/tasks"
+    }
+}
+
+/// 解除绑定：把线程恢复到全部在线核，并迁出 BASE_CPUSET 分组。
+/// 用于黑名单包——从受控列表移除后须真正放手，否则仍残留在自建 cpuset 内。
+/// 目标分组按其 oom 档位还原（top-app / foreground / background），
+/// 避免一律塞进 foreground 而被该分组的 cpus 限制二次约束。
+pub fn release_affinity(tid: i32, topo: &crate::cpuset::CpuTopology) {
+    if topo.cpuset_enabled {
+        // 优先按 oom 档位回归；目标不存在时退回 foreground
+        let adj = read_oom_score_adj(tid).unwrap_or(0);
+        let cpuset_root = "/dev/cpuset";
+        let want = format!("{}{}", cpuset_root, release_group_suffix(adj));
+        let dst = if std::path::Path::new(&want).exists() {
+            want
+        } else {
+            format!("{}/foreground/tasks", cpuset_root)
+        };
+        let _ = fs::OpenOptions::new().append(true).open(&dst)
+            .and_then(|mut f| f.write_all(format!("{}\n", tid).as_bytes()));
+    }
+    // cpuset 迁移会重设亲和性；此处兜底覆盖未启用 cpuset 或迁移失败的情况
+    let all = topo.clip_online(&topo.present_cpus);
+    let _ = all.set_affinity(tid);
+}
+
 /// 读 /proc/{pid}/cmdline 取包名
 pub fn read_cmdline(pid: i32) -> Option<String> {
     let cl = fs::read_to_string(format!("/proc/{}/cmdline", pid)).ok()?;

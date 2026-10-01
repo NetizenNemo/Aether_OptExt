@@ -72,6 +72,28 @@ pub struct AppConfig {
     /// 进程被迁入自建 cpuset 子组后不再出现于 top-app/cgroup.procs，
     /// Scheduler 的 inotify 监听失效，需此旁路通知其重新查询前台应用
     pub notify_scheduler: bool,
+    /// 用户黑名单：features.blacklist 列出的包名完全不受控
+    /// （不绑核、不纳入缓存、不注入 eBPF 白名单），优先级高于一切规则
+    pub blacklist: HashSet<String>,
+    /// 渲染安全护栏：渲染线程强制高性能核 + 拒绝单核绑核，防 fence 超时黑屏（默认 true）
+    pub render_guard: bool,
+}
+
+impl AppConfig {
+    /// 包名是否命中黑名单（含 :suffix 进程按其 base_pkg 判定）
+    pub fn in_blacklist(&self, pkg: &str) -> bool {
+        if self.blacklist.is_empty() { return false; }
+        let base = pkg.split(':').next().unwrap_or(pkg);
+        self.blacklist.contains(pkg) || self.blacklist.contains(base)
+    }
+
+    /// 合并自动分配缓存并重新应用豁免过滤。
+    /// 缓存条目可能重新引入黑名单包或 asoul 名单包，故每次 merge 后必须重施过滤
+    pub fn merge_cache(&mut self) {
+        cache::merge(&mut self.pkg_set, &mut self.rules);
+        self.apply_blacklist();
+        self.apply_asoul_ignore();
+    }
 }
 
 /// 检测 asoul 模块是否安装（其守护进程以 /data/adb/asoul_affinity_opt 为根）
@@ -113,6 +135,15 @@ impl AppConfig {
         let foreground_aware = root["features"]["foreground"].as_bool().unwrap_or(true);
         let load_aware = root["features"]["load_aware"].as_bool().unwrap_or(true);
         let notify_scheduler = root["features"]["notify_scheduler"].as_bool().unwrap_or(true);
+        // 渲染安全护栏：默认开启，防单核/小核渲染导致 fence 超时黑屏
+        let render_guard = root["features"]["render_guard"].as_bool().unwrap_or(true);
+        // 用户黑名单：features.blacklist 数组，列入的包名完全不受控
+        let blacklist: HashSet<String> = root["features"]["blacklist"].members()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
         let entries = if root.is_array() { &root } else { &root["rules"] };
         if !entries.is_array() { return None; }
 
@@ -157,7 +188,9 @@ impl AppConfig {
             rules, pkg_set, wild, mtime: mt, ebpf, topo: topo.clone(),
             asoul_ignore: HashSet::new(),
             foreground_aware, load_aware, notify_scheduler,
+            blacklist, render_guard,
         };
+        cfg.apply_blacklist();
         cfg.apply_asoul_ignore();
         Some(cfg)
     }
@@ -165,6 +198,29 @@ impl AppConfig {
     /// 该包是否存在线程级规则
     pub fn pkg_has_thread_rules(&self, pkg: &str) -> bool {
         self.rules.iter().any(|r| !r.thread.is_empty() && fnmatch(&r.pkg, pkg))
+    }
+
+    /// 应用用户黑名单：从规则/包名/通配中彻底剔除，使其不被任何路径选中。
+    /// 需在 cache::merge 之后再次调用（缓存条目可能重新引入黑名单包）
+    pub fn apply_blacklist(&mut self) -> usize {
+        if self.blacklist.is_empty() { return 0; }
+        // 克隆以脱离 self 借用，供 retain 闭包使用
+        let bl = self.blacklist.clone();
+        let hit = |p: &String| {
+            let base = p.split(':').next().unwrap_or(p);
+            bl.contains(p) || bl.contains(base)
+        };
+        let n_before = self.rules.len();
+        // 规则同样按 base_pkg 判定，避免带 :suffix 的死规则残留
+        self.rules.retain(|r| !hit(&r.pkg));
+        self.pkg_set.retain(|p| !hit(p));
+        self.wild.retain(|w| !hit(w));
+        let removed = n_before - self.rules.len();
+        if removed > 0 {
+            crate::info!("blacklist: {} pkgs, filtered {} rules",
+                self.blacklist.len(), removed);
+        }
+        removed
     }
 
     /// 应用 asoul 豁免：过滤规则/包名/通配，返回是否发生豁免
@@ -175,9 +231,13 @@ impl AppConfig {
         self.rules.retain(|r| !ignore.contains(&r.pkg));
         self.pkg_set.retain(|p| !ignore.contains(p));
         self.wild.retain(|w| !ignore.contains(w));
+        // 仅在首次装载或确有剔除时打日志，避免 merge_cache 反复调用刷屏
+        let removed = n_before - self.rules.len();
+        if self.asoul_ignore.is_empty() || removed > 0 {
+            crate::info!("asoul compat: ignoring {} pkgs (filtered {} rules)",
+                ignore.len(), removed);
+        }
         self.asoul_ignore = ignore;
-        crate::info!("asoul compat: ignoring {} pkgs (filtered {} rules)",
-            self.asoul_ignore.len(), n_before - self.rules.len());
         true
     }
 }
@@ -280,10 +340,14 @@ pub mod cache {
     }
 
     /// 批量保存：一次读-去重-写，避免多个新应用时循环全量读写
-    pub fn save_batch(pkgs: &[String], all: &[(i32, String, Vec<(i32, String)>)], big: &str, mid1: &str, mid2: &str, little: &str) -> usize {
+    pub fn save_batch(pkgs: &[String], all: &[(i32, String, Vec<(i32, String)>)], big: &str, mid1: &str, mid2: &str, little: &str,
+        user_blacklist: &HashSet<String>) -> usize {
         let mut entries = Vec::new();
         for pkg in pkgs {
             if is_blacklisted(pkg) { continue; }
+            // 用户黑名单二次兜底：不依赖调用方 filter，杜绝写入
+            let base = pkg.split(':').next().unwrap_or(pkg);
+            if user_blacklist.contains(pkg) || user_blacklist.contains(base) { continue; }
             if let Some(entry) = build_entry(pkg, all, big, mid1, mid2, little) {
                 entries.push(entry);
             }

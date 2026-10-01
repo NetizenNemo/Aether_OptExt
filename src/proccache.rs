@@ -196,9 +196,34 @@ impl ProcCache {
         };
 
         let topo = &cfg.topo;
+        // 黑名单包 PID 集合：命中则释放绑定（热加载新增黑名单时兜底）。
+        // 注意 bl_pids 须同时覆盖 tasks 记录与 OptExt 分组内实际残留的线程
+        let bl_pids: std::collections::HashSet<i32> = if cfg.blacklist.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            self.tasks.values()
+                .map(|e| e.pid)
+                .collect::<std::collections::HashSet<i32>>()
+                .into_iter()
+                .filter(|pid| {
+                    let pkg = self.pkgs.get(pid).map(|(p, _)| p.clone())
+                        .or_else(|| process::read_cmdline(*pid));
+                    pkg.map_or(false, |p| cfg.in_blacklist(&p))
+                })
+                .collect()
+        };
+
         let mut dead_tids = Vec::new();
+        let mut released = 0usize;
         for (tid, e) in self.tasks.iter_mut() {
             if e.failed { continue; }  // 上次失败（cpuset 限制），跳过无效重试
+            // 黑名单：解除绑定并回收条目，使其完全不受控
+            if bl_pids.contains(&e.pid) {
+                process::release_affinity(*tid, topo);
+                dead_tids.push(*tid);
+                released += 1;
+                continue;
+            }
             let is_bg = bg_cache.get(&e.pid).copied().unwrap_or(false);
             Self::adjust_target(*tid, e, cfg, elapsed_ticks, is_bg);
             let (res, eff) = process::affinity_set_ex(*tid, &e.cpus, &e.cpuset_dir, topo);
@@ -233,6 +258,50 @@ impl ProcCache {
         for tid in &dead_tids {
             self.task_del(*tid);
         }
+        if released > 0 {
+            crate::info!("blacklist: released {} threads from control", released);
+        }
         dead_tids
+    }
+
+    /// 清扫 OptExt 分组内残留的黑名单线程，返回被释放的 tid 列表。
+    /// 热加载新增黑名单时，这些进程早已被 in_blacklist 挡在 tasks 之外，
+    /// 无法通过遍历 tasks 发现，必须直接扫描 cpuset 分组内容。
+    /// 调用方须用返回的 tid 清理 eBPF APPLIED_MAP，否则其 fork 的后代仍会被上报
+    pub fn release_blacklisted_orphans(cfg: &config::AppConfig, topo: &crate::cpuset::CpuTopology) -> Vec<i32> {
+        let mut freed = Vec::new();
+        if cfg.blacklist.is_empty() || !topo.cpuset_enabled { return freed; }
+        let base = crate::common::base_cpuset();
+        // 递归收集 BASE_CPUSET 下所有子组的 tasks
+        let mut dirs = vec![std::path::PathBuf::from(base)];
+        if let Ok(rd) = std::fs::read_dir(base) {
+            for e in rd.flatten() {
+                if e.path().is_dir() { dirs.push(e.path()); }
+            }
+        }
+        // 按 pid 去重：同进程数十线程只解析一次包名
+        let mut checked: HashMap<i32, bool> = HashMap::new();
+        for dir in dirs {
+            let tasks = dir.join("tasks");
+            let Ok(content) = std::fs::read_to_string(&tasks) else { continue };
+            for line in content.lines() {
+                let Ok(tid) = line.trim().parse::<i32>() else { continue };
+                // 线程所属进程（tid 可能非主线程，用 Tgid 反查主进程）
+                let pid = process::tid_tgid(tid).unwrap_or(tid);
+                let hit = *checked.entry(pid).or_insert_with(|| {
+                    process::read_cmdline(pid)
+                        .or_else(|| process::tid_comm(pid))
+                        .map_or(false, |p| cfg.in_blacklist(&p))
+                });
+                if hit {
+                    process::release_affinity(tid, topo);
+                    freed.push(tid);
+                }
+            }
+        }
+        if !freed.is_empty() {
+            crate::info!("blacklist: swept {} orphan threads out of cpuset", freed.len());
+        }
+        freed
     }
 }
