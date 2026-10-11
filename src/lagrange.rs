@@ -20,12 +20,16 @@ use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
 
 // ---- 代价模型常数 ----
-const ETA_CPU: f64 = 0.1;
-const ETA_LLC: f64 = 0.05;
-const ETA_MEM: f64 = 0.05;
+
+
+
 const ETA_TIER: f64 = 0.1;
 
-const C_CPU: f64 = 10.0; // 1 + TURBO_MAX(9)
+
+/// LLC / 内存约束的目标值。s[1]/s[2] 归一化为加权平均后量纲为 O(0.1)，
+/// 与原 C_LLC=0.05*C_CPU=0.5 不再可比——量纲不匹配会让误差恒为正、
+/// λ 单调漂移而无法收敛（实测 λ[1] 两小时从 0.55 涨到 6.6）。
+
 const REF_MISS: f64 = 0.05;
 const REF_L2_KB: f64 = 1024.0;
 const TEMP: f64 = 0.1;
@@ -36,11 +40,9 @@ const DEFAULT_L2_KB: f64 = 512.0;
 
 static PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
 const PERF_TYPE_HARDWARE: u32 = 0;
-const PERF_TYPE_SOFTWARE: u32 = 1;
 const PERF_TYPE_RAW: u32 = 4;
 const PERF_COUNT_HW_INSTRUCTIONS: u64 = 0;
 const PERF_COUNT_HW_CPU_CYCLES: u64 = 1;
-const PERF_COUNT_SW_CONTEXT_SWITCHES: u64 = 1;
 /// x86 Intel 的 LLC 事件编码（PERF_TYPE_RAW）
 const X86_LL_CACHE_RD: u64 = 0x0036;
 const X86_LL_CACHE_MISS_RD: u64 = 0x0037;
@@ -88,6 +90,32 @@ pub struct Lambda {
     nodes: DashMap<i32, Arc<NodeData>>,
     /// 求解结果缓存：tid → 该线程应绑的核集
     targets: DashMap<i32, CpuSet>,
+    /// 拥塞感知阻尼状态（跨周期）
+    congestion: std::sync::Mutex<Congestion>,
+}
+
+/// 跨周期的拥塞度量。signal 越大 → cone 越小 → γ 越小
+struct Congestion {
+    /// 权重的相对变化率 EWMA
+    v_fr: f64,
+    /// 约束量与线程数的变化 EWMA
+    dz: f64,
+    /// 拥塞缩放因子 EWMA
+    cone: f64,
+    /// 上轮的层分配分布，用于算 v_fr
+    prev_tier: Vec<f64>,
+    n: usize,
+    init: bool,
+}
+
+impl Default for Congestion {
+    fn default() -> Self {
+        Self {
+            v_fr: 0.0, dz: 0.0, cone: 1.0,
+            prev_tier: Vec::new(),
+            n: 0, init: false,
+        }
+    }
 }
 
 struct NodeData {
@@ -117,15 +145,15 @@ impl Lambda {
     /// 依据实测拓扑构建层信息。层序：e_core → p_core → hp_core（低性能在前）
     pub fn new(topo: &CpuTopology) -> Option<Self> {
         let online = topo.online_cpus_public();
+        // 按实测的完整频率层构建（2+2+4 等 4 层架构不被压成 3 层）。
+        // 顶层给更大 L2 估值，使 sens 项对高性能层形成正确偏好
+        let n_tiers = topo.all_tiers.len();
         let mut raw: Vec<(CpuSet, f64)> = Vec::new();
-        // 三层：能效 / 中间 / 超大；空层跳过
-        for (set, l2) in [
-            (topo.e_core, DEFAULT_L2_KB),
-            (topo.p_core, DEFAULT_L2_KB),
-            (topo.hp_core, 1024.0),
-        ] {
+        for (i, set) in topo.all_tiers.iter().enumerate() {
             let c = set.intersection(&online);
-            if c.count() > 0 { raw.push((c, l2)); }
+            if c.count() == 0 { continue; }
+            let l2 = if n_tiers > 1 && i == n_tiers - 1 { 1024.0 } else { DEFAULT_L2_KB };
+            raw.push((c, l2));
         }
         if raw.len() < 2 { return None; } // 单层设备无分配意义
 
@@ -137,46 +165,33 @@ impl Lambda {
             TierInfo { cpus, l2_kb: l2, rho }
         }).collect();
 
-        let m = 3 + tiers.len();
-        let lambda = (0..m).map(|r| {
-            // 层容量乘子给非零初值：λ 全零会使各层 pi 相等，argmax 退化为取首层
-            // （即全落小核）。初值使 sens 项生效——高层 L2 大 → pressure 小 →
-            // sens 小 → pi 小 → 对重线程形成正确偏好，随后由梯度法自行校正。
-            let init = if r >= 3 { 1.0_f64 } else { 0.0_f64 };
-            AtomicU64::new(init.to_bits())
-        }).collect();
+        let m = tiers.len();
+        // 层容量乘子给非零初值：λ 全零会使各层 π 相等、softmax 退化为均匀分布。
+        // 初值使 sens 项生效 —— 高层 L2 大 → pressure 小 → sens 小 → π 小 →
+        // 对重线程形成正确偏好，随后由梯度法自行校正
+        let lambda = (0..m).map(|_| AtomicU64::new(1.0_f64.to_bits())).collect();
         Some(Self {
             tiers,
             lambda,
             gamma: AtomicU64::new(1.0f64.to_bits()),
             nodes: DashMap::new(),
             targets: DashMap::new(),
+            congestion: std::sync::Mutex::new(Congestion::default()),
         })
     }
 
     pub fn num_tiers(&self) -> usize { self.tiers.len() }
-    fn m(&self) -> usize { 3 + self.tiers.len() }
+    fn m(&self) -> usize { self.tiers.len() }
 
     fn read_lambda(&self, r: usize) -> f64 { f64::from_bits(self.lambda[r].load(Ordering::Relaxed)) }
     fn write_lambda(&self, r: usize, v: f64) { self.lambda[r].store(v.to_bits(), Ordering::Release); }
 
+    /// 各层的容量配额 = 该层核数占总核数的比例
     fn capacity(&self, r: usize) -> f64 {
-        match r {
-            0 => C_CPU,
-            1 => 0.05 * C_CPU,
-            2 => 0.10 * C_CPU,
-            _ => self.tiers[r - 3].rho,
-        }
+        self.tiers.get(r).map(|t| t.rho).unwrap_or(0.0)
     }
 
-    fn eta(&self, r: usize) -> f64 {
-        match r {
-            0 => ETA_CPU,
-            1 => ETA_LLC,
-            2 => ETA_MEM,
-            _ => ETA_TIER,
-        }
-    }
+    fn eta(&self, _r: usize) -> f64 { ETA_TIER }
 
     /// 迭代一次 λ 并返回各约束的当前累积量
     fn step_lambdas(&self, s: &[f64]) {
@@ -195,12 +210,17 @@ impl Lambda {
     {
         let k = self.tiers.len();
         let mut pi = Vec::with_capacity(k);
+        // π 只保留「随层变化」的项。λ[0] + λ[1]·c_llc + λ[2]·m_mem 对所有层是
+        // 同一个常数，而 softmax 具有平移不变性 —— 它们对层选择零影响，却因
+        // 约束量 s 与层分配解耦而无反馈地单调漂移（实测 λ[1] 1h23min 从 0.002
+        // 涨到 0.663 且无回落）。只有 λ[kk]·sens_kk 因 cap_kb 随层变化而真正驱动分配。
+        let _ = m_mem;
         for (kk, t) in self.tiers.iter().enumerate() {
             let cap_kb = t.l2_kb.max(64.0);
             let pressure = (insn_share * c_llc) / cap_kb;
             let ref_pressure = REF_MISS / REF_L2_KB;
             let sens = (1.0 + pressure / ref_pressure).max(1.0);
-            pi.push(lambdas[0] + lambdas[1] * c_llc + lambdas[2] * m_mem + lambdas[3 + kk] * sens);
+            pi.push(lambdas[kk] * sens);
         }
         let min_pi = pi.iter().cloned().fold(f64::MAX, f64::min);
         let t_safe = TEMP.max(1e-6);
@@ -239,23 +259,16 @@ impl Lambda {
         static SALT: AtomicU64 = AtomicU64::new(0);
         let salt = SALT.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x2545F4914F6CDD1D);
 
-        let (s, assign): (Vec<f64>, Vec<(i32, usize)>) = snap.par_iter()
+        let (mut s, assign): (Vec<f64>, Vec<(i32, usize)>) = snap.par_iter()
             .fold(
                 || (vec![0.0f64; m], Vec::new()),
                 |(mut s, mut a), &(tid, c, mm, ins)| {
-                    let (w, probs, _best) = self.thread_w(&lambdas, c, mm, ins);
-                    // 全局约束按权重加权累加（对齐参考实现）。
-                    // 原先 s[0] 用 Σinsn_share ≡ 1.0，恒等于 1 而失去意义，
-                    // 导致 λ[0] 被永久钳零；s[1]/s[2] 亦未加权
-                    s[0] += w;
-                    s[1] += w * c;
-                    s[2] += w * mm;
-                    // 累积量按概率软累加：这是 λ 收敛的前提。
-                    // 若按硬分配累加，s 只能取 0/1 两端，永远匹配不了 rho
+                    let (_w, probs, _best) = self.thread_w(&lambdas, c, mm, ins);
+                    // s[kk] 是各层的「线程数占比」，与 rho[k] 同量纲。
+                    // 它不能按指令量加权 —— cap 定义为核心数比例，按线程数配平才可收敛
                     for kk in 0..k {
-                        s[3 + kk] += ins * probs[kk];
+                        s[kk] += probs[kk];
                     }
-                    // 实际绑定按概率采样，期望与 s 一致
                     let tier = pick_tier(tid, &probs, salt);
                     a.push((tid, tier));
                     (s, a)
@@ -270,27 +283,72 @@ impl Lambda {
                 },
             );
 
+        // 归一化为占比，消去线程数带来的线性增长（否则 s 随 N 线性增长，
+        // 误差恒为正、λ 只能单调上升）
+        let n = snap.len().max(1) as f64;
+        for kk in 0..k {
+            s[kk] /= n;
+        }
         let _ = k;
         (assign, s)
     }
 
     /// 用 solve 的累积量推进 λ 与 gamma
     pub fn advance(&self, s: &[f64]) -> f64 {
-        self.step_lambdas(s);
-        // 误差只统计层容量约束 s[3..]/rho。s[0..3] 是 CPU/LLC/内存全局约束，
-        // 与层配额的量纲完全不同：s[0] 是权重和（量级随线程数变化）、
-        // s[1]/s[2] 在 PMU 缺事件时会退化为常量。把三者纳入统计会让 err 被
-        // 常数偏差主导 —— 实测恒为 0.90~1.00，而真实层误差仅 0.007~0.020，
-        // 指标完全失去指示作用。
+        // 误差统计（先算，供 boost 使用）。
+        // 只统计层容量约束 s[3..]/rho —— 三者已统一为「占比」量纲。
+        // s[0] 是权重和（量级随线程数变化），纳入会让 err 被常数偏差主导
         let mut max_rel = 0.0f64;
         for kk in 0..self.tiers.len() {
-            let r = 3 + kk;
-            let cap = self.capacity(r).max(FLOAT_EPS);
-            let rel = (s[r] - cap).abs() / cap;
+            let cap = self.capacity(kk).max(FLOAT_EPS);
+            let rel = (s[kk] - cap).abs() / cap;
             if rel > max_rel { max_rel = rel; }
         }
-        // 误差越大 → gamma 越大，加快收敛
-        let gamma = (1.0 * (1.0 + max_rel)).clamp(0.1, 8.0);
+
+        // 拥塞感知阻尼：系统变化剧烈时压低学习率。
+        // 缺失时 γ 峰值达 8（误差 26 时单步 Δλ≈21）→ 必然过冲，
+        // 表现为 λ 在约束间反复拉扯、长时间不收敛。
+        let gamma = {
+            let mut cg = self.congestion.lock().unwrap_or_else(|p| p.into_inner());
+            // v_fr：层分配分布的相对变化率（相邻周期 s[3..] 的归一化变化）。
+            // 原参考实现用权重向量的变化率，等价性上此处用分配分布更直接，
+            // 且无需跨周期保存每线程权重
+            let v_fr = if cg.prev_tier.len() == self.tiers.len() {
+                let mut sq = 0.0f64;
+                for kk in 0..self.tiers.len() {
+                    let a = s[kk];
+                    let b = cg.prev_tier[kk];
+                    let avg = ((a + b) / 2.0).max(FLOAT_EPS);
+                    let d = a - b;
+                    sq += d * d / avg;
+                }
+                sq.sqrt()
+            } else { 0.0 };
+            cg.prev_tier = s.to_vec();
+            // dz：约束量变化 + 线程数变化率
+            let dn = if cg.init && cg.n > 0 {
+                (self.nodes.len() as f64 - cg.n as f64).abs() / cg.n as f64
+            } else { 0.0 };
+            let dz = if cg.init {
+                v_fr + DN_WEIGHT * dn
+            } else { 0.0 };
+            cg.n = self.nodes.len();
+            cg.init = true;
+
+            cg.v_fr = (1.0 - V_FR_EWMA) * cg.v_fr + V_FR_EWMA * v_fr;
+            cg.dz = (1.0 - DZ_EWMA) * cg.dz + DZ_EWMA * dz;
+
+            let signal = cg.v_fr.max(cg.dz * DZ_WEIGHT);
+            let cone_base = (1.0 / (1.0 + CONGESTION_BETA * signal))
+                .clamp(CONE_SCALE_MIN, CONE_SCALE_MAX);
+            cg.cone = (1.0 - CONE_EWMA) * cg.cone + CONE_EWMA * cone_base;
+
+            // cone ≤ 1 起阻尼作用；boost 提供有限加速；总上限 2.0 防过冲
+            let boost = 1.0 + max_rel.min(1.0);
+            (cg.cone * boost).clamp(0.05, 2.0)
+        };
+
+        self.step_lambdas(s);
         self.gamma.store(gamma.to_bits(), Ordering::Release);
         max_rel
     }
@@ -304,8 +362,8 @@ impl Lambda {
             .map(|t| t.cpus.intersection(&online))
             .unwrap_or_default();
         // 仅当存在更高层可并入时才做 min_cpus 扩容。
-        // 最高性能层通常只有 2 核（如 8 核的 6-7），若强扩到 min_cpus 会并成
-        // 全核，等于放弃绑定；且该层是性能核，2 核本身是合理配置。
+        // 最高性能层通常只有 2 核（如 2+2+4 的 6-7、6+2 的 6-7），若强扩到
+        // min_cpus 会并成全核，等于放弃绑定；且该层是性能核，2 核本身合理。
         let is_top = tier + 1 >= self.tiers.len();
         if !is_top {
             let mut idx = tier;
@@ -365,33 +423,79 @@ fn pick_tier(tid: i32, probs: &[f64], salt: u64) -> usize {
 // ============================================================
 // perf_event 采集
 // ============================================================
+/// 每线程的 perf 计数器句柄。
+/// 只保留 4 个真正参与计算的计数器——原先还有一个 CONTEXT_SWITCHES，
+/// 但它的增量算出后即被丢弃（`let _ =`），纯粹浪费一个 fd。
 pub(crate) struct Handles {
-    insn: i32, cycles: i32, llc: i32, miss: i32, ctx: i32,
-    last_insn: u64, last_cycles: u64, last_llc: u64, last_miss: u64, last_ctx: u64,
+    insn: i32, cycles: i32, llc: i32, miss: i32,
+    last_insn: u64, last_cycles: u64, last_llc: u64, last_miss: u64,
+    /// /proc/{tid}/stat 的 utime+stime，用于免 fd 预筛选
+    last_ticks: u64,
+    /// ticks 基准是否已建立
+    ticks_valid: bool,
+    /// 连续空闲（tick 无增量）轮次
+    idle_rounds: u8,
 }
 
+/// 每线程占用的 fd 数，用于 fd 预算估算
+pub(crate) const FDS_PER_THREAD: usize = 4;
+
+// ---- 拥塞感知阻尼：抑制 λ 振荡 ----
+// 系统变化剧烈时降低学习率 γ，避免过冲。缺失时 λ 会随线程数/负载波动
+// 无界漂移（实测 λ[1] 两小时 0.55→6.6 未收敛）。
+const CONGESTION_BETA: f64 = 1.0;
+const V_FR_EWMA: f64 = 0.3;
+const DZ_EWMA: f64 = 0.3;
+const CONE_EWMA: f64 = 0.4;
+const CONE_SCALE_MIN: f64 = 0.15;
+const CONE_SCALE_MAX: f64 = 1.00;
+const DZ_WEIGHT: f64 = 5.0;
+/// 线程数变化在 dz 中的权重
+const DN_WEIGHT: f64 = 1.0;
+
+/// 连续空闲多少轮后回收 fd。
+/// /proc/{tid}/stat 的 tick 粒度是 10ms，而采样间隔约 33s，中等活跃线程
+/// 常有整轮无 tick 增量的情况。阈值取 2 时实测 2 小时回收 56432 次
+/// （held 仅数百），fd 反复 open/close，每次最多 7 次 perf_event_open，
+/// 系统调用开销远超收益。取 6 轮（约 3 分钟）可显著抑制抖动。
+const IDLE_RECLAIM_ROUNDS: u8 = 20;
+
 impl Handles {
-    pub(crate) fn open(tid: i32) -> Self {
-        let mut h = Self {
-            insn: -1, cycles: -1, llc: -1, miss: -1, ctx: -1,
-            last_insn: 0, last_cycles: 0, last_llc: 0, last_miss: 0, last_ctx: 0,
-        };
-        h.insn = open_hw(tid, PERF_COUNT_HW_INSTRUCTIONS);
-        h.cycles = open_hw(tid, PERF_COUNT_HW_CPU_CYCLES);
-        let (l, m) = open_llc(tid);
-        h.llc = l; h.miss = m;
-        h.ctx = open_sw(tid, PERF_COUNT_SW_CONTEXT_SWITCHES);
-        // 首轮只校准基准
-        if h.insn >= 0 { h.last_insn = read_u64(h.insn).unwrap_or(0); }
-        if h.cycles >= 0 { h.last_cycles = read_u64(h.cycles).unwrap_or(0); }
-        if let Some((l, m)) = read_pair(h.llc, h.miss) { h.last_llc = l; h.last_miss = m; }
-        if h.ctx >= 0 { h.last_ctx = read_u64(h.ctx).unwrap_or(0); }
-        h
+    pub(crate) fn new() -> Self {
+        Self {
+            insn: -1, cycles: -1, llc: -1, miss: -1,
+            last_insn: 0, last_cycles: 0, last_llc: 0, last_miss: 0,
+            last_ticks: 0, ticks_valid: false, idle_rounds: 0,
+        }
     }
 
-    fn close(&self) {
-        for fd in [self.insn, self.cycles, self.llc, self.miss, self.ctx] {
+    fn is_open(&self) -> bool { self.insn >= 0 }
+
+    /// 打开 4 个计数器。首轮只校准基准，避免把历史累计值当成增量
+    fn open_fds(&mut self, tid: i32) {
+        self.insn = open_hw(tid, PERF_COUNT_HW_INSTRUCTIONS);
+        self.cycles = open_hw(tid, PERF_COUNT_HW_CPU_CYCLES);
+        let (l, m) = open_llc(tid);
+        self.llc = l; self.miss = m;
+        if self.insn >= 0 { self.last_insn = read_u64(self.insn).unwrap_or(0); }
+        if self.cycles >= 0 { self.last_cycles = read_u64(self.cycles).unwrap_or(0); }
+        if let Some((l, m)) = read_pair(self.llc, self.miss) { self.last_llc = l; self.last_miss = m; }
+        self.idle_rounds = 0;
+    }
+
+    fn close_fds(&mut self) {
+        for fd in [self.insn, self.cycles, self.llc, self.miss] {
             if fd >= 0 { unsafe { libc::close(fd); } }
+        }
+        self.insn = -1; self.cycles = -1; self.llc = -1; self.miss = -1;
+    }
+
+    /// 标记本轮空闲；连续 IDLE_RECLAIM_ROUNDS 轮后回收 fd
+    fn mark_idle(&mut self, ticks: u64) {
+        self.last_ticks = ticks;
+        self.idle_rounds = self.idle_rounds.saturating_add(1);
+        if self.idle_rounds >= IDLE_RECLAIM_ROUNDS && self.is_open() {
+            self.close_fds();
         }
     }
 
@@ -401,16 +505,14 @@ impl Handles {
         let insn = read_u64(self.insn)?;
         let cycles = read_u64(self.cycles).unwrap_or(0);
         let (llc, miss) = read_pair(self.llc, self.miss).unwrap_or((0, 0));
-        let ctx = read_u64(self.ctx).unwrap_or(0);
 
         let d_insn = insn.saturating_sub(self.last_insn);
         let d_cycles = cycles.saturating_sub(self.last_cycles);
         let d_llc = llc.saturating_sub(self.last_llc);
         let d_miss = miss.saturating_sub(self.last_miss);
-        let _ = ctx.saturating_sub(self.last_ctx);
 
         self.last_insn = insn; self.last_cycles = cycles;
-        self.last_llc = llc; self.last_miss = miss; self.last_ctx = ctx;
+        self.last_llc = llc; self.last_miss = miss;
 
         if d_insn == 0 { return None; }
         // c_llc = LLC 访问中的 miss 率；m_mem = miss 率 × CPI，反映内存墙程度
@@ -432,16 +534,6 @@ fn open_hw(tid: i32, config: u64) -> i32 {
     let fd2 = perf_event_open(&mut attr, tid);
     if fd2 >= 0 { unsafe { libc::ioctl(fd2, PERF_EVENT_IOC_ENABLE as i32, 0); } }
     fd2
-}
-
-fn open_sw(tid: i32, config: u64) -> i32 {
-    let mut attr: perf_event_attr = unsafe { mem::zeroed() };
-    attr.size = mem::size_of::<perf_event_attr>() as u32;
-    attr.type_ = PERF_TYPE_SOFTWARE; attr.config = config;
-    attr.exclude_hv = 1; attr.exclude_kernel = 1;
-    let fd = perf_event_open(&mut attr, tid);
-    if fd >= 0 { unsafe { libc::ioctl(fd, PERF_EVENT_IOC_ENABLE as i32, 0); } }
-    fd
 }
 
 fn open_llc(tid: i32) -> (i32, i32) {
@@ -530,12 +622,25 @@ fn cache_events() -> (u64, u64) {
     }
 }
 
-/// perf_event 是否可用于本进程（快速探测，避免每周期无效开 fd）
+/// perf_event 是否可用于本进程（快速探测，避免每周期无效开 fd）。
+/// 同时检查 fd 软上限：每线程 FDS_PER_THREAD 个 fd，大核数设备上
+/// 线程多时可能逼近 RLIMIT_NOFILE（实测 2541 线程 → 11520 fd，
+/// 软上限 32768 的 35%），余量不足时直接不启用，避免中途 EMFILE
 pub fn perf_available() -> bool {
     let tid = unsafe { libc::getpid() } as i32;
     let fd = open_hw(tid, PERF_COUNT_HW_INSTRUCTIONS);
     if fd < 0 { return false; }
     unsafe { libc::close(fd); }
+
+    // fd 预算：预留 1/4 给其它用途
+    let mut lim: libc::rlimit = unsafe { mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+        let budget = (lim.rlim_cur as usize).saturating_mul(3) / 4;
+        if budget < FDS_PER_THREAD * 64 {
+            crate::warn!("λmod: fd budget too small ({}), skipped", budget);
+            return false;
+        }
+    }
     true
 }
 
@@ -545,13 +650,33 @@ pub fn sample_tids(lm: &Lambda, tids: &[i32], handles: &mut std::collections::Ha
     // 清理已退出线程的 fd。用集合查找，避免 retain 内线性 contains 的 O(n*m)
     let alive: std::collections::HashSet<i32> = tids.iter().copied().collect();
     handles.retain(|tid, h| {
-        if alive.contains(tid) { true } else { h.close(); false }
+        if alive.contains(tid) { true } else { h.close_fds(); false }
     });
 
     let mut measured: Vec<(i32, f64, f64, u64)> = Vec::new();
     let mut total_insn: u64 = 0;
     for &tid in tids {
-        let h = handles.entry(tid).or_insert_with(|| Handles::open(tid));
+        let h = handles.entry(tid).or_insert_with(Handles::new);
+        // 免 fd 预筛选：用 /proc/{tid}/stat 的 tick 判断本轮是否消耗过 CPU。
+        // 空闲线程不开 perf fd —— 实测 903 个持句柄线程中仅 56 个有指令增量，
+        // fd 几乎全被空闲线程占着（3612 个中约 94% 属白占）。
+        match crate::process::read_thread_cpu_time(tid) {
+            Some(t) if h.ticks_valid && t == h.last_ticks => {
+                h.mark_idle(t);
+                continue;
+            }
+            Some(t) => {
+                h.last_ticks = t;
+                h.ticks_valid = true;
+                h.idle_rounds = 0;
+            }
+            None => {
+                // 线程退出或不可读，释放 fd 并等待上层清理条目
+                h.close_fds();
+                continue;
+            }
+        }
+        if !h.is_open() { h.open_fds(tid); }
         if let Some((c, m, d)) = h.sample() {
             total_insn = total_insn.saturating_add(d);
             measured.push((tid, c, m, d));
@@ -611,31 +736,13 @@ pub fn tick(tids: &[i32], cfg: &AppConfig) -> usize {
     lm.retain_nodes(&keep);
     lm.retain_targets(&keep);
 
-    let (assign, s) = lm.solve();
-    let err = lm.advance(&s);
-
-    // 诊断：周期性输出 λ 与层分配分布，用于定位收敛问题
-    {
-        use std::sync::atomic::AtomicU64 as AU;
-        static TICK_N: AU = AU::new(0);
-        let c = TICK_N.fetch_add(1, Ordering::Relaxed);
-        if c % 5 == 0 {
-            let mut cnt = vec![0usize; lm.num_tiers()];
-            for (_, t) in &assign { if *t < cnt.len() { cnt[*t] += 1; } }
-            let lams: Vec<String> = (0..lm.m()).map(|r| format!("{:.3}", lm.read_lambda(r))).collect();
-            let ss: Vec<String> = s.iter().map(|v| format!("{:.3}", v)).collect();
-            crate::info!("λmod: N={} dist={:?} λ=[{}] s=[{}] err={:.2}",
-                assign.len(), cnt, lams.join(","), ss.join(","), err);
-        }
-    }
+    let (assign, _s) = lm.solve();
+    lm.advance(&_s);
 
     // 目标缓存同步
     for (tid, tier) in &assign {
         let t = lm.tier_target(*tier, &cfg.topo, cfg.min_cpus);
         lm.set_target(*tid, t);
-    }
-    if err > 2.0 {
-        crate::info!("λmod: solver error {:.2} (n={})", err, n);
     }
     n
 }

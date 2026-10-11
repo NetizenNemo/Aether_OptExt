@@ -235,6 +235,10 @@ pub struct CpuTopology {
     pub e_core: CpuSet,
     pub p_core: CpuSet,
     pub hp_core: CpuSet,
+    /// 全部频率层，按频率升序（e → … → hp）。
+    /// 2+2+4 这类 4 层架构下，中间两层会被 p_core 合并，λmod 需按此拿到
+    /// 未经合并的完整层列表，否则丢失一层分配粒度。单层设备长度为 1。
+    pub all_tiers: Vec<CpuSet>,
 }
 
 /// 读取在线核集合并与 present 求交，失败返回 None
@@ -275,7 +279,7 @@ impl CpuTopology {
 }
 
 /// 按 cpufreq 策略检测核心分层，按最高频率升序分组：首组为 e-core，末组为 hp-core，中间为 p-core
-fn detect_core_types() -> (CpuSet, CpuSet, CpuSet) {
+fn detect_core_types() -> Vec<CpuSet> {
     let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
     if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
         for entry in entries.flatten() {
@@ -309,23 +313,15 @@ fn detect_core_types() -> (CpuSet, CpuSet, CpuSet) {
         }
     }
     groups.sort_by_key(|(f, _)| *f);
-    let mut e = CpuSet::new();
-    let mut p = CpuSet::new();
-    let mut h = CpuSet::new();
-    let n = groups.len();
-    for (i, (_, cpus)) in groups.iter().enumerate() {
-        let target = if i == 0 {
-            &mut e
-        } else if i == n - 1 {
-            &mut h
-        } else {
-            &mut p
-        };
+    // 每个频率组即一层，按频率升序（小核 → 大核）。
+    // 4 层架构（如 2+2+4）不再被压成 3 层，供 λmod 按真实层数分配
+    groups.iter().map(|(_, cpus)| {
+        let mut s = CpuSet::new();
         for &cpu in cpus {
-            target.set(cpu);
+            s.set(cpu);
         }
-    }
-    (e, p, h)
+        s
+    }).collect()
 }
 
 /// 初始化 CPU 拓扑，检测 cpuset 可用性并创建 BASE_CPUSET 目录
@@ -341,6 +337,7 @@ pub fn init_cpu_topo() -> CpuTopology {
         e_core: CpuSet::new(),
         p_core: CpuSet::new(),
         hp_core: CpuSet::new(),
+        all_tiers: Vec::new(),
     };
 
     if let Ok(content) = fs::read_to_string("/sys/devices/system/cpu/present") {
@@ -355,11 +352,17 @@ pub fn init_cpu_topo() -> CpuTopology {
     };
     topo.online_now.set(online);
     topo.online_at.set(now_ms());
-    let (e, p, h) = detect_core_types();
+    let tiers = detect_core_types();
     // 语义分层保留完整检测结果，绑定时刻由 clip_online 动态裁剪（thermal 上下线自适应）
-    topo.e_core = e;
+    // 全层列表供 λmod 使用（4 层架构不被压成 3 层）；e/p/hp 保持三段语义向后兼容
+    topo.all_tiers = tiers.clone();
+    topo.e_core = tiers.first().cloned().unwrap_or_default();
+    topo.hp_core = if tiers.len() > 1 { tiers[tiers.len() - 1] } else { CpuSet::new() };
+    let mut p = CpuSet::new();
+    for t in tiers.iter().skip(1).take(tiers.len().saturating_sub(2)) {
+        p.or(t);
+    }
     topo.p_core = p;
-    topo.hp_core = h;
 
     // 诊断：online 与根 cpuset 范围（决定大核是否可绑）
     let online = fs::read_to_string("/sys/devices/system/cpu/online")
