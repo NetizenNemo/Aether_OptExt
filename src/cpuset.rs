@@ -206,6 +206,40 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
 }
 
 /// 按合并后的 CPU 集合确保 cpuset 子目录存在，返回目录名（cpuset 未启用或创建失败返回空串）
+/// 清理 OptExt 下不再使用的空分组目录，返回删除数量。
+///
+/// 配置热加载会切换新的 cpus 组合（如 0-5 → 0-3,6），旧分组里的线程迁走后
+/// 目录会空置残留，长期运行或反复改配置会在 base_cpuset 下堆积大量废弃目录。
+/// 只删除 tasks 为空的目录，`keep` 中的现用分组不受影响。
+pub fn prune_empty_dirs(keep: &std::collections::HashSet<String>) -> usize {
+    let base = base_cpuset();
+    let Ok(rd) = fs::read_dir(base) else { return 0 };
+    let mut removed = 0;
+    for e in rd.flatten() {
+        let path = e.path();
+        let Ok(ft) = e.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if keep.contains(name) {
+            continue;
+        }
+        // 仅删空分组：tasks 非空说明仍有线程在用
+        let tasks = path.join("tasks");
+        let empty = fs::read_to_string(&tasks)
+            .map(|c| c.trim().is_empty())
+            .unwrap_or(false);
+        if !empty {
+            continue;
+        }
+        if fs::remove_dir(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 pub fn ensure_cpuset_dir(cpus: &CpuSet, topo: &CpuTopology) -> String {
     if !topo.cpuset_enabled {
         return String::new();

@@ -48,6 +48,10 @@ const FAIL_RETRY_TTL: u8 = 10;
 /// 超出该窗口后不再读取 /proc/{tid}/comm
 const RENDER_CHECK_MAX: u8 = 5;
 
+/// cpuset 空分组清理间隔（周期数）。20 轮约 2 分钟，足够让线程迁移完成，
+/// 避免把瞬时为空的分组误删
+const PRUNE_INTERVAL: u8 = 20;
+
 /// λmod 采样降频：每 N 个 affinity_sync 周期推进一次。
 /// 取 3 意味着 -s 2（6s/轮）时约 18s 采样一次
 const LAGRANGE_TICK_DIV: u8 = 3;
@@ -62,6 +66,9 @@ pub struct ProcCache {
     pub tasks: HashMap<i32, TaskEntry>,
     /// 上次负载采样时间，用于换算 tick 窗口
     last_sample: Option<Instant>,
+    /// cpuset 空分组清理计数：配置切换 cpus 组合后旧分组会空置，
+    /// 需定期回收，否则长期运行会在 base_cpuset 下堆积废弃目录
+    prune_round: u8,
     /// λmod 采样降频计数。每次采样需读每个线程的 /proc/{tid}/stat
     /// 做免 fd 预筛选（千级线程即千次文件读），而线程负载特征不会在
     /// 秒级内剧变，故每 LAGRANGE_TICK_DIV 个周期推进一次
@@ -70,7 +77,7 @@ pub struct ProcCache {
 
 impl ProcCache {
     pub fn new() -> Self {
-        Self { pkgs: HashMap::new(), tasks: HashMap::new(), last_sample: None, lambda_round: 0 }
+        Self { pkgs: HashMap::new(), tasks: HashMap::new(), last_sample: None, prune_round: 0, lambda_round: 0 }
     }
 
     pub fn clear(&mut self) {
@@ -378,6 +385,20 @@ impl ProcCache {
         }
         if released > 0 {
             crate::info!("blacklist: released {} threads from control", released);
+        }
+
+        // 回收废弃的 cpuset 分组：热加载切换 cpus 组合后旧目录会空置残留
+        self.prune_round = self.prune_round.wrapping_add(1);
+        if self.prune_round % PRUNE_INTERVAL == 0 && topo.cpuset_enabled {
+            let keep: std::collections::HashSet<String> = self.tasks
+                .values()
+                .filter(|e| !e.cpuset_dir.is_empty())
+                .map(|e| e.cpuset_dir.clone())
+                .collect();
+            let n = crate::cpuset::prune_empty_dirs(&keep);
+            if n > 0 {
+                crate::info!("cpuset: 清理 {} 个废弃分组", n);
+            }
         }
         dead_tids
     }
