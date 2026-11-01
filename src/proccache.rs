@@ -10,8 +10,13 @@ pub struct TaskEntry {
     pub cpus: CpuSet,
     pub cpuset_dir: String,
     pub is_thread_rule: bool,
-    /// 上次绑定失败（非 ESRCH），跳过重复尝试避免无效 setaffinity 刷 CPU
+    /// 上次绑定失败（非 ESRCH），退避期间跳过避免无效 setaffinity 刷 CPU。
+    /// 配合 fail_age 使用：退避到期会重试，不能永久跳过 —— 失败原因可能是
+    /// 临时性的（cpuset 短暂不可写、内核瞬时拒绝），永久跳过会让线程
+    /// 在该进程生命周期内彻底脱离管理。
     pub failed: bool,
+    /// 失败后已经历周期数，超过 FAIL_RETRY_TTL 则清除 failed 重试
+    fail_age: u8,
     /// 配置原始目标（前台/负载动态调整后可恢复）
     pub base_cpus: CpuSet,
     /// 上次采样的 utime+stime（动态负载感知用，0=未初始化）
@@ -24,10 +29,32 @@ pub struct TaskEntry {
     /// 该线程名命中渲染管线特征。渲染线程任何路径下都不得被压到小核，
     /// 否则提交延迟会触发 fence 超时 → BufferQueue 断流黑屏
     is_render: bool,
+    /// 距上次实际校验亲和性的周期数。目标未变时跳过 setaffinity，
+    /// 但内核可能因外部 cgroup 迁移静默重置亲和性，故仍按 TTL 强制校验
+    verified_age: u8,
+    /// is_render 的动态探测次数。每周期读一次 /proc/{tid}/comm 代价过高
+    /// （千级线程每轮上千次文件读），只在前 RENDER_CHECK_MAX 个周期探测，
+    /// 线程改名通常发生在创建后很短的时间窗内
+    render_checks: u8,
 }
 
 /// cap 存活周期数：到期后重探一次，保证核/分组恢复时能扩回配置目标
 const CAP_TTL: u8 = 3;
+
+/// 绑定失败后的退避周期数。到期重试一次，避免临时性失败导致线程永久脱离管理
+const FAIL_RETRY_TTL: u8 = 10;
+
+/// is_render 动态探测的周期上限。线程改名发生在创建后早期，
+/// 超出该窗口后不再读取 /proc/{tid}/comm
+const RENDER_CHECK_MAX: u8 = 5;
+
+/// λmod 采样降频：每 N 个 affinity_sync 周期推进一次。
+/// 取 3 意味着 -s 2（6s/轮）时约 18s 采样一次
+const LAGRANGE_TICK_DIV: u8 = 3;
+
+/// 亲和性强制校验周期。目标未变时跳过 sched_setaffinity 以省系统调用，
+/// 但外部 cgroup 迁移会静默重置亲和性，故每隔这么多周期强制校验一次
+const VERIFY_TTL: u8 = 5;
 
 /// 双模式共用进程缓存：eBPF 事件驱动增量维护，proc 模式触发全量重建
 pub struct ProcCache {
@@ -35,11 +62,15 @@ pub struct ProcCache {
     pub tasks: HashMap<i32, TaskEntry>,
     /// 上次负载采样时间，用于换算 tick 窗口
     last_sample: Option<Instant>,
+    /// λmod 采样降频计数。每次采样需读每个线程的 /proc/{tid}/stat
+    /// 做免 fd 预筛选（千级线程即千次文件读），而线程负载特征不会在
+    /// 秒级内剧变，故每 LAGRANGE_TICK_DIV 个周期推进一次
+    lambda_round: u8,
 }
 
 impl ProcCache {
     pub fn new() -> Self {
-        Self { pkgs: HashMap::new(), tasks: HashMap::new(), last_sample: None }
+        Self { pkgs: HashMap::new(), tasks: HashMap::new(), last_sample: None, lambda_round: 0 }
     }
 
     pub fn clear(&mut self) {
@@ -120,11 +151,16 @@ impl ProcCache {
             cpuset_dir: dir,
             is_thread_rule: result.is_thread_rule,
             failed: false,
+            fail_age: 0,
             base_cpus: result.cpus,
             prev_ticks: 0,
             cap,
             cap_age: 0,
             is_render: crate::rule_match::is_render_thread(comm),
+            render_checks: 0,
+            // 初始即置为 TTL，表示「需要校验」：新线程虽已在 task_apply 绑过，
+            // 但随后的 cpuset 迁移会重置亲和性，首个周期就该校验一次
+            verified_age: VERIFY_TTL,
         });
         true
     }
@@ -132,14 +168,16 @@ impl ProcCache {
     /// 前台/负载动态调整：仅作用于包级 fallback 线程（线程规则为用户精确指定不动）。
     /// - 后台进程（oom_score_adj >= 900, cached）收缩到 e_core，回前台恢复配置目标
     /// - load_aware 开启时，按 /proc/{tid}/stat tick 增量分级：高负载 hp_core，空闲 e_core
-    fn adjust_target(tid: i32, e: &mut TaskEntry, cfg: &config::AppConfig, elapsed_ticks: u64, is_bg: bool) {
+    /// 返回 true 表示目标已变更（调用方需立即重新绑定）
+    fn adjust_target(tid: i32, e: &mut TaskEntry, cfg: &config::AppConfig, elapsed_ticks: u64, is_bg: bool) -> bool {
         let topo = &cfg.topo;
-        if e.is_thread_rule { return; }
+        if e.is_thread_rule { return false; }
 
         // is_render 动态刷新：FORK 时 comm 仍是进程名，线程随后才被改名成
         // RenderThread。eBPF 的 task_rename 是 optional hook（可能 attach 失败），
         // 此时快照不会更新、渲染保护失效。故按需重读 comm，一经确认即永久置位。
-        if !e.is_render {
+        if !e.is_render && e.render_checks < RENDER_CHECK_MAX {
+            e.render_checks = e.render_checks.saturating_add(1);
             if let Some(c) = process::tid_comm(tid) {
                 if crate::rule_match::is_render_thread(&c) {
                     e.is_render = true;
@@ -176,8 +214,9 @@ impl ProcCache {
             if want.count() > 0 && want != e.cpus {
                 e.cpus = want;
                 e.cpuset_dir = ensure_cpuset_dir(&want, topo);
+                return true;
             }
-            return;
+            return false;
         }
 
         // λmod 优先：perf_event 实测 + 拉格朗日求解给出的层目标。
@@ -190,8 +229,9 @@ impl ProcCache {
                     if t != e.cpus {
                         e.cpus = t;
                         e.cpuset_dir = ensure_cpuset_dir(&t, topo);
+                        return true;
                     }
-                    return;
+                    return false;
                 }
             }
         }
@@ -217,7 +257,9 @@ impl ProcCache {
         if desired != e.cpus {
             e.cpus = desired;
             e.cpuset_dir = ensure_cpuset_dir(&desired, topo);
+            return true;
         }
+        false
     }
 
     /// 遍历 tasks 应用亲和性，返回 dead_tids
@@ -257,16 +299,32 @@ impl ProcCache {
                 .collect()
         };
 
-        // λmod 周期推进：采样 → 求解 → 推进 λ → 刷新目标缓存
+        // λmod 周期推进：采样 → 求解 → 推进 λ → 刷新目标缓存。
+        // 降频执行：采样阶段要读每个线程的 /proc/{tid}/stat，是当前最大的
+        // 周期性开销；targets 缓存会让降频期间仍沿用上次决策
         if crate::lagrange::active() {
-            let tids: Vec<i32> = self.tasks.keys().copied().collect();
-            crate::lagrange::tick(&tids, cfg);
+            self.lambda_round = self.lambda_round.wrapping_add(1);
+            if self.lambda_round % LAGRANGE_TICK_DIV == 0 {
+                let tids: Vec<i32> = self.tasks.keys().copied().collect();
+                crate::lagrange::tick(&tids, cfg);
+            }
         }
 
         let mut dead_tids = Vec::new();
         let mut released = 0usize;
         for (tid, e) in self.tasks.iter_mut() {
-            if e.failed { continue; }  // 上次失败（cpuset 限制），跳过无效重试
+            // 失败退避：窗口内跳过避免刷 CPU；到期清除 failed 重试一次，
+            // 否则临时性失败会让线程永久脱离管理
+            if e.failed {
+                e.fail_age = e.fail_age.saturating_add(1);
+                if e.fail_age <= FAIL_RETRY_TTL {
+                    continue;
+                }
+                e.failed = false;
+                e.fail_age = 0;
+                // 关键：置为待校验，确保重试不会被 verified_age 短路拦住
+                e.verified_age = VERIFY_TTL;
+            }
             // 黑名单：解除绑定并回收条目，使其完全不受控
             if bl_pids.contains(&e.pid) {
                 process::release_affinity(*tid, topo);
@@ -275,11 +333,21 @@ impl ProcCache {
                 continue;
             }
             let is_bg = bg_cache.get(&e.pid).copied().unwrap_or(false);
-            Self::adjust_target(*tid, e, cfg, elapsed_ticks, is_bg);
+            let changed = Self::adjust_target(*tid, e, cfg, elapsed_ticks, is_bg);
+            // 目标未变且未到强制校验周期 → 跳过 sched_setaffinity。
+            // 千级线程每轮上千次系统调用，而亲和性在稳态下不会自行漂移
+            if !changed && e.verified_age < VERIFY_TTL {
+                e.verified_age = e.verified_age.saturating_add(1);
+                continue;
+            }
+            e.verified_age = 0;
             let (res, eff) = process::affinity_set_ex(*tid, &e.cpus, &e.cpuset_dir, topo);
             match res {
                 process::AffinityResult::Dead => dead_tids.push(*tid),
-                process::AffinityResult::Failed => e.failed = true,
+                process::AffinityResult::Failed => {
+                    e.failed = true;
+                    e.fail_age = 0;
+                }
                 process::AffinityResult::Ok => {}  // 成功，不标记失败
             }
             // 目标被内核限缩：记录 cap 并按生效集更新，后续周期零开销短路

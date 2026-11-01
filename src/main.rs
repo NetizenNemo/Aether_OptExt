@@ -17,6 +17,11 @@ mod common;
 mod rule_match;
 mod inotify;
 mod lagrange;
+mod screen;
+
+/// 息屏期间的亲和性校正周期。息屏后没有前台应用、没有渲染提交、屏幕不刷新，
+/// 周期性全量重绑上千线程几乎没有收益，纯耗电
+const SCREEN_OFF_PERIOD_SECS: u64 = 60;
 
 use config::*;
 use cpuset::CpuSet;
@@ -370,6 +375,9 @@ fn main() {
     let mut comm_capacity = 8192u32;
     let mut need_full_scan = true;
     let mut affinity_deadline = Instant::now();
+    // 息屏降频状态：上一轮是否亮屏 / 是否需要立即强制校正
+    let mut screen_was_on = true;
+    let mut force_sync = false;
 
     // proc 模式状态
     let mut proc_state = ProcState::new();
@@ -392,6 +400,12 @@ fn main() {
     }
 
     info!("mode: {}", if bpf_state.ok { "eBPF event-driven" } else { "proc polling" });
+    // 息屏降频是否可用：读不到背光节点时校正周期固定为 3*interval
+    info!("screen: 息屏降频 {}", if screen::available() {
+        "enabled (息屏后校正周期 60s)"
+    } else {
+        "unavailable (无背光节点，校正周期固定)"
+    });
 
     // λmod 初始化（perf_event 不可用或关闭时自动回退 tick 启发式）
     let lagrange_ok = lagrange::init(&cfg.topo, cfg.lagrange_enable);
@@ -407,6 +421,15 @@ fn main() {
     let mut last_reload = Instant::now() - Duration::from_secs(10);
 
     loop {
+        // 息屏降频：息屏时把校正周期从 3*interval 拉长到 SCREEN_OFF_PERIOD_SECS。
+        // 亮屏瞬间强制立即校正一次 —— 息屏期间可能错过了绑定调整
+        let screen_on = screen::is_on();
+        if screen_on && !screen_was_on {
+            force_sync = true;
+        }
+        screen_was_on = screen_on;
+        let sync_period = if screen_on { 3 * interval } else { SCREEN_OFF_PERIOD_SECS };
+
         // 配置热加载检测 (每轮, 5s debounce 防重复触发)
         let mut config_changed = false;
         if inotify::check_changed(&config_path, &mut inotify_fd, &mut last_reload, &cfg.mtime) {
@@ -447,13 +470,14 @@ fn main() {
                 }
             }
 
-            // 定期纠正亲和性 (每 3*interval 秒)
-            if affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
+            // 定期纠正亲和性（亮屏 3*interval 秒 / 息屏 SCREEN_OFF_PERIOD_SECS）
+            if force_sync || affinity_deadline.elapsed() >= Duration::from_secs(sync_period) {
                 let dead_tids = proc_state.cache.affinity_sync(&cfg);
                 for tid in dead_tids {
                     bpf::applied_del(&mut bpf_state, tid);
                 }
                 affinity_deadline = Instant::now();
+                force_sync = false;
             }
         } else {
             // ===== proc 轮询模式 (增量维护, 仿参考项目) =====
@@ -465,10 +489,13 @@ fn main() {
             let _ = reloaded;
 
             // 定期纠正亲和性 (每 3*interval 秒 或 进程数变化时)
-            if proc_state.force_affinity || affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
+            if force_sync || proc_state.force_affinity
+                || affinity_deadline.elapsed() >= Duration::from_secs(sync_period)
+            {
                 let _dead = proc_state.cache.affinity_sync(&cfg);
                 proc_state.force_affinity = false;
                 affinity_deadline = Instant::now();
+                force_sync = false;
             }
 
             // 未知应用自动分配：每 120 轮(4 分钟) 或 进程数增长时

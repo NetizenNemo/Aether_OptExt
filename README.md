@@ -17,7 +17,7 @@ emm...艇长猫猫还是很喜欢大家的使用哒～使用艇长是俺的荣�
 |:---|:---|
 | 系统 | Android 8.0+（内核需支持 cpuset，一般均满足） |
 | 权限 | Magisk 或 KernelSU root |
-| 内核（可选） | eBPF 加速需 `CONFIG_BPF_SYSCALL` / `CONFIG_BPF_EVENTS`，tracefs 需挂载；不支持自动回退 proc 轮询 |
+| 内核（可选） | eBPF 加速需 `CONFIG_BPF_SYSCALL` / `CONFIG_BPF_EVENTS`，tracefs 需挂载；不支持自动回退 proc 轮询。λmod 求解器需 `CONFIG_PERF_EVENTS` 且 `perf_event_paranoid` 允许访问，不可用自动回退 `load_aware` |
 
 ### 构建端（Windows 示例）
 
@@ -75,12 +75,23 @@ Magisk / KernelSU 中刷入 `out/Aether-OptExt_*.zip` 即可。
 | 配置文件 | `/sdcard/Android/Aether/threads.json` |
 | 日志文件 | `/sdcard/Android/Aether/threads_log.txt` |
 | 自动分配缓存 | `/sdcard/Android/Aether/threads_cache` |
+| 前台变化信号 | `/sdcard/Android/Aether/fg_hint`（供 Aether Scheduler 读取） |
 
 ## 配置文件格式
 
 ```json
 {
-  "features": { "ebpf": true, "auto-for-none": true },
+  "features": {
+    "ebpf": true,
+    "auto-for-none": true,
+    "foreground": true,
+    "load_aware": true,
+    "notify_scheduler": true,
+    "blacklist": [],
+    "render_guard": true,
+    "min_cpus": 4,
+    "lagrange": { "enable": true }
+  },
   "rules": [
     {
       "friendly": "原神",
@@ -104,6 +115,8 @@ Magisk / KernelSU 中刷入 `out/Aether-OptExt_*.zip` 即可。
 - `features.blacklist` — 用户黑名单（默认空数组）：列入的包名**完全不受控**，不绑核、不纳入自动分配缓存、不注入 eBPF 白名单、不发 fg_hint 信号，优先级高于一切规则；含 `:suffix` 的进程按其基础包名判定
 - `features.render_guard` — 渲染安全护栏（默认 true）：① 渲染管线线程（`RenderThread`/`Gfx`/`Vulkan`/`RHI`/`Surface` 等）若被配到与性能核无交集的集合，自动升档到 `{hp_core}`/`{p_core}`；② 绑核目标少于 2 核时拒绝并回退（单核在负载波动下易饿死线程，触发 fence 超时黑屏）。降级动作会写入 `safety:` 日志
 - `features.min_cpus` — 包级最小核数（默认 4）：包级 `other` 目标核数不足时，按 `{p_core}` → `{hp_core}` → 全在线核顺序并入，避免多线程应用全挤在小核上导致卡顿；设为 `1` 禁用。**仅作用于包级 `other`，用户手写的线程规则不扩充**
+- `features.notify_scheduler` — 前台变化通知（默认 true）：检测到应用进程需要应用 cgroup 策略时，向 `/sdcard/Android/Aether/fg_hint` 写入 `<pkg>:<pid>:<timestamp_ms>`，供 Aether Scheduler 感知前台切换。仅发「有变化」信号、由 Scheduler 自行 `dumpsys` 判定；按 pid（10s）与包名（60s）双重节流防刷屏
+- `features.lagrange` — λmod 求解器（默认 `{ "enable": true }`）：基于 perf_event 实测（指令数/周期数/LLC 访问与 miss）构建线程指纹，以带容量约束的效用最大化模型求解各层配额，比 tick 启发式更能表达「6 小核 : 2 大核」这类中间分布。性能计数器不可用时自动回退 `load_aware`；仅作用于包级 `other`
 - `other` — 该应用所有线程的默认绑核
 - `comm` — 按线程名匹配的绑核规则（支持 `*` 通配符）
 
@@ -111,7 +124,19 @@ Magisk / KernelSU 中刷入 `out/Aether-OptExt_*.zip` 即可。
 
 ### eBPF 加速
 
-挂载 `sched/sched_process_exec` tracepoint，新进程执行时 BPF 程序在纳秒级将 PID 写入 HASH map。主循环每轮读取 map 获取新进程，**先于 /proc 扫描发现**。需内核支持以下配置：
+挂载 5 个 tracepoint，事件经 ringbuf 实时上报，**先于 /proc 扫描发现**新进程/线程：
+
+| tracepoint | 类别 | 必需 | 用途 |
+|:---|:---|:---|:---|
+| `sched_process_fork` | sched | 是 | 新线程创建（毫秒级发现） |
+| `sched_process_exec` | sched | 是 | 进程 exec |
+| `sched_process_exit` | sched | 是 | 进程/线程退出，回收跟踪 |
+| `task_rename` | task | 否 | 线程改名后重新匹配规则 |
+| `cgroup_attach_task` | cgroup | 否 | 进程被移入 `top-app` cgroup → 前台变化信号 |
+
+任一必需 tracepoint 挂载失败则整体回退 `/proc` 轮询；可选 tracepoint 失败不影响主链路（缺失时相应功能降级，如无 `task_rename` 时靠周期性重读 `comm` 兜底）。
+
+需内核支持以下配置：
 
 ```
 CONFIG_BPF_SYSCALL=y
@@ -122,7 +147,7 @@ CONFIG_PERF_EVENTS=y
 
 通过 `features.ebpf: true/false` 控制。
 
-> 注：若内核使用 Android Vendor Hooks（`CONFIG_ANDROID_VENDOR_HOOKS=y`），BPF map 创建可正常进行，但 `bpf_perf_event_output` 等高级功能受限，程序自动回退 `/proc` 轮询。
+> 注：tracepoint 字段偏移（`child_pid`/`newcomm`/`dst_id` 等）在运行时从 tracefs 的 `format` 文件解析，不同内核版本无需改动代码。若内核使用 Android Vendor Hooks（`CONFIG_ANDROID_VENDOR_HOOKS=y`），BPF map 创建可正常进行，但 `bpf_perf_event_output` 等高级功能受限，程序自动回退 `/proc` 轮询。
 
 ### 自动分配缓存
 
@@ -140,6 +165,18 @@ CONFIG_PERF_EVENTS=y
 | 默认 | 其他未匹配线程 | 小核集群 |
 
 通过 `features.auto-for-none: true/false` 控制。
+
+### λmod 求解器
+
+`features.lagrange` 开启时，以 perf_event 实测数据替代线程名启发式来分配核心：
+
+- **线程指纹**：perf 计数器读取每线程的指令数、CPU 周期数、LLC 访问与 LLC miss，得到缓存 miss 率与 CPI
+- **求解模型**：把绑核建模为带容量约束的效用最大化，各层容量配额 `rho` = 该层核数 / 总核数，用梯度法迭代拉格朗日乘子；层概率取 softmax，实际绑定按概率采样，使长期分布收敛到配额
+- **软分配**：按概率软累加而非硬取 argmax —— 硬分配只能整层取一，永远表达不了「75% : 25%」这类中间分布
+- **自动降级**：perf_event 不可用（内核不支持或权限不足）时回退 `load_aware`；探测到的有效层数 < 2 时跳过（单层设备无分配意义）
+- **开销控制**：先用 `/proc/{tid}/stat` 的 tick 增量做免 fd 预筛选，仅活跃线程才开 perf 计数器；连续空闲约 11 分钟才回收句柄。计数器的 fd 用量在启动时按 `RLIMIT_NOFILE` 预检，余量不足则不启用
+
+> 与 `load_aware` 的区别：`load_aware` 按 tick 增量分高/中/低三档，粒度粗；λmod 依据缓存行为与指令量求解配额，能区分同为「高负载」但缓存特征迥异的线程。
 
 ### 语义占位符（多拓扑自适应）
 
@@ -185,6 +222,17 @@ CONFIG_PERF_EVENTS=y
 - 最高频组 → `{hp_core}`（超大核）
 
 同一套模板自适应任意 CPU 规格，无需按拓扑维护多份配置文件。auto-for-none 自动分配同样按 4 层分级（big/mid1/mid2/little）绑定。
+
+运行时（λmod）同样按 cpufreq 实测分层，并保留**未经合并的完整层列表**：`2+2+4` 这类四层架构会得到 4 个独立层，不会被压成 3 层，从而保留完整的分配粒度。语义占位符中的 `{p_core}` 仍按「中间层合并」给出（绑核用），两者互不影响。
+
+支持的拓扑形态：
+
+| 架构 | 检测层数 | e | p | hp |
+|:---|:---|:---|:---|:---|
+| `2+2+4` | 3 层 | 4 核 | 2 核 | 2 核 |
+| `1+2+2+3` | 4 层 | 3 核 | 4 核（中间两层合并） | 1 核 |
+| `6+2` | 2 层 | 6 核 | — | 2 核 |
+| 单簇 | 1 层 | 全部 | — | — |
 
 
 ## 许可证
