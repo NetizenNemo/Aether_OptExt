@@ -400,12 +400,12 @@ fn main() {
     }
 
     info!("mode: {}", if bpf_state.ok { "eBPF event-driven" } else { "proc polling" });
-    // 息屏降频是否可用：读不到背光节点时校正周期固定为 3*interval
-    info!("screen: 息屏降频 {}", if screen::available() {
-        "enabled (息屏后校正周期 60s)"
+    // 息屏降频：报告判据来源，便于跨设备排查
+    if screen::available() {
+        info!("screen: 息屏降频 enabled via {} (息屏后校正周期 60s)", screen::source());
     } else {
-        "unavailable (无背光节点，校正周期固定)"
-    });
+        info!("screen: 息屏降频 unavailable (无可用节点，校正周期固定)");
+    }
 
     // λmod 初始化（perf_event 不可用或关闭时自动回退 tick 启发式）
     let lagrange_ok = lagrange::init(&cfg.topo, cfg.lagrange_enable);
@@ -423,7 +423,7 @@ fn main() {
     loop {
         // 息屏降频：息屏时把校正周期从 3*interval 拉长到 SCREEN_OFF_PERIOD_SECS。
         // 亮屏瞬间强制立即校正一次 —— 息屏期间可能错过了绑定调整
-        let screen_on = screen::is_on();
+        let screen_on = screen::poll_state();
         if screen_on && !screen_was_on {
             force_sync = true;
         }

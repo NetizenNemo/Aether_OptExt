@@ -458,7 +458,10 @@ const DN_WEIGHT: f64 = 1.0;
 /// 常有整轮无 tick 增量的情况。阈值取 2 时实测 2 小时回收 56432 次
 /// （held 仅数百），fd 反复 open/close，每次最多 7 次 perf_event_open，
 /// 系统调用开销远超收益。取 6 轮（约 3 分钟）可显著抑制抖动。
-const IDLE_RECLAIM_ROUNDS: u8 = 20;
+/// 实测受控 2730 线程时 perf_fd 达 13268（软上限 32768 的 41%），
+/// 线程数再增长会逼近上限。取 10 轮（λmod 已降频到 3 轮采样，约 3 分钟空闲）
+/// 在「fd 峰值」与「open/close 抖动」之间折中
+const IDLE_RECLAIM_ROUNDS: u8 = 10;
 
 impl Handles {
     pub(crate) fn new() -> Self {
