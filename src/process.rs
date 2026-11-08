@@ -56,6 +56,27 @@ pub fn scan_unknown(set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String,
     result
 }
 
+/// 判断线程是否已在目标 cpuset 分组内。`dir` 为空（未启用 cpuset）时视为匹配。
+///
+/// 亲和性掩码相同不代表分组正确：例如渲染线程被 render_guard 提升到全核后，
+/// 掩码与系统默认值一致，若只看 sched_getaffinity 就会误判「已符合目标」而
+/// 从不迁入 OptExt 分组，表现为该线程完全没被接管。
+fn in_cpuset_dir(tid: i32, dir: &str) -> bool {
+    if dir.is_empty() {
+        return true;
+    }
+    let Ok(c) = fs::read_to_string(format!("/proc/{}/cgroup", tid)) else {
+        return false;
+    };
+    let base = crate::common::base_cpuset();
+    let name = base.rsplit('/').next().unwrap_or("OptExt");
+    let want = format!("/{}/{}", name, dir);
+    c.lines()
+        .find(|l| l.contains(":cpuset:"))
+        .map(|l| l.trim_end().ends_with(&want))
+        .unwrap_or(false)
+}
+
 /// 读 /proc/{tid}/status 的 Cpus_allowed_list —— 内核视角该任务真实可用核
 /// (= cpu online ∩ 所在各级 cpuset 的 effective_cpus)，thermal 限核时最权威
 pub fn read_allowed_cpus(tid: i32) -> Option<CpuSet> {
@@ -121,9 +142,10 @@ pub fn affinity_set_ex(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::
     };
     let report = |eff: &CpuSet| if *eff != *cpus { Some(eff.clone()) } else { None };
 
-    // sched_getaffinity 短路：已符合目标零开销返回
+    // 短路：掩码与分组都符合才算达成目标。
+    // 只比对掩码会漏掉「掩码相同但仍在 top-app 等系统分组」的情况
     if let Some(curr) = CpuSet::get_affinity(tid) {
-        if curr == *target {
+        if curr == *target && in_cpuset_dir(tid, dir) {
             return (AffinityResult::Ok, report(target));
         }
     }

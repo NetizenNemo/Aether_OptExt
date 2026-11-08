@@ -44,8 +44,18 @@ pub fn parse_entry(entry: &json::JsonValue) -> Option<ParsedEntry> {
     let mut thread_rules = Vec::new();
     if entry["cpuset"]["comm"].is_object() {
         for (cpus, names) in entry["cpuset"]["comm"].entries() {
+            // 空 cpus 键必须跳过：「{p_core}」等占位符在 2 层 SOC 上会展开成
+            // 空字符串，产生 "": [...] 这类规则。若保留，线程名匹配后目标为
+            // 0 核，最终回退到 present_cpus（全核）且 cpuset_dir 为空、不迁
+            // 分组 —— 表现为整个应用完全没被分配
+            if cpus.trim().is_empty() {
+                continue;
+            }
             for nv in names.members() {
                 if let Some(name) = nv.as_str() {
+                    if name.trim().is_empty() {
+                        continue;
+                    }
                     thread_rules.push((cpus.to_string(), name.to_string(), rule_prio(name)));
                 }
             }
