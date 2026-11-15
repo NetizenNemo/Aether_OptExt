@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, shutil, subprocess, zipfile
+import os, sys, shutil, subprocess, zipfile, json
 from datetime import datetime
 from pathlib import Path
 
@@ -9,6 +9,11 @@ OUT_DIR = SCRIPT_DIR / "out"
 MODULE_DIR = SCRIPT_DIR / "magisk_module"
 MODULE_ZIP = OUT_DIR / f"Aether-OptExt_{datetime.now():%Y%m%d_%H%M%S}-OS4.zip"
 TARGET = "aarch64-linux-android"
+
+# KernelSU / Magisk 原生更新：module.prop 的 updateJson 指向仓库中的 update.json，
+# 由 package() 每次打包时按当次版本号与 zip 文件名生成
+REPO = "NetizenNemo/Aether_OptExt"
+UPDATE_JSON_URL = f"https://raw.githubusercontent.com/{REPO}/main/update.json"
 
 def info(m): print(f"[INFO] {m}")
 def warn(m): print(f"[WARN] {m}")
@@ -139,6 +144,7 @@ def package():
     # 必须显式指定 UTF-8：Windows 上 write_text 默认 GBK，会把中文描述写成乱码
     prop.write_text(
         f"id=aether-optext\nname=Aether OptExt\nversion={ver}\nversionCode={vc}\nauthor=NekoNemo\n"
+        f"updateJson={UPDATE_JSON_URL}\n"
         "description=一个使用Rust开发的Android 应用/游戏线程 CPU 亲和性优化工具 Feedback: 1028546498\n",
         encoding="utf-8", newline="\n",
     )
@@ -152,6 +158,22 @@ def package():
                 full = Path(root) / f; rel = str(full.relative_to(MODULE_DIR)).replace("\\", "/")
                 if rel.startswith(".") or "/." in rel: continue
                 z.write(binary if rel == "aether-optext" else full, rel)
+
+    # 生成 KernelSU / Magisk 原生更新描述。
+    # 约定 release tag = v{version}，zipUrl 指向本次 release 的附件；
+    # changelog 指向仓库根的同名文件，更新界面会直接展示其内容
+    tag = f"v{ver}"
+    update = {
+        "version": ver,
+        "versionCode": vc,
+        "zipUrl": f"https://github.com/{REPO}/releases/download/{tag}/{MODULE_ZIP.name}",
+        "changelog": f"https://raw.githubusercontent.com/{REPO}/main/CHANGELOG.md",
+    }
+    (SCRIPT_DIR / "update.json").write_text(
+        json.dumps(update, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n",
+    )
+    info(f"更新描述: update.json -> {tag}")
 
 def main():
     # eBPF 事件驱动默认禁用 (纯 /proc 轮询); 仅当 .o 缺失时用 WSL 重新编译 Rust eBPF
