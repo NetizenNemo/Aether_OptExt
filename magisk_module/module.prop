@@ -3,4 +3,5 @@ name=Aether OptExt
 version=1115-Release
 versionCode=261115
 author=NekoNemo
+updateJson=https://raw.githubusercontent.com/NetizenNemo/Aether_OptExt/main/update.json
 description=一个使用Rust开发的Android 应用/游戏线程 CPU 亲和性优化工具 Feedback: 1028546498
