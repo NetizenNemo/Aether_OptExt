@@ -115,7 +115,9 @@ fn notify_fg_change(pkg: &str, pid: i32) -> bool {
 fn event_affinity_apply(tid: i32, cpus: &CpuSet, cpuset_dir: &str, cfg: &AppConfig, bpf_state: &mut bpf::BpfCtx)
     -> (bool, Option<CpuSet>)
 {
-    let (res, eff) = process::affinity_set_ex(tid, cpus, cpuset_dir, &cfg.topo);
+    // 首次绑定必须校验分组：渲染线程被提升到全核后掩码与系统默认一致，
+    // 只比掩码会漏判而永不迁入 OptExt 分组
+    let (res, eff) = process::affinity_set_ex(tid, cpus, cpuset_dir, &cfg.topo, true);
     match res {
         process::AffinityResult::Dead => (true, None),
         _ => {
@@ -472,7 +474,7 @@ fn main() {
 
             // 定期纠正亲和性（亮屏 3*interval 秒 / 息屏 SCREEN_OFF_PERIOD_SECS）
             if force_sync || affinity_deadline.elapsed() >= Duration::from_secs(sync_period) {
-                let dead_tids = proc_state.cache.affinity_sync(&cfg);
+                let dead_tids = proc_state.cache.affinity_sync(&cfg, screen_on);
                 for tid in dead_tids {
                     bpf::applied_del(&mut bpf_state, tid);
                 }
@@ -492,7 +494,7 @@ fn main() {
             if force_sync || proc_state.force_affinity
                 || affinity_deadline.elapsed() >= Duration::from_secs(sync_period)
             {
-                let _dead = proc_state.cache.affinity_sync(&cfg);
+                let _dead = proc_state.cache.affinity_sync(&cfg, screen_on);
                 proc_state.force_affinity = false;
                 affinity_deadline = Instant::now();
                 force_sync = false;

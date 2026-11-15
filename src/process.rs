@@ -116,12 +116,12 @@ fn log_bind_fail(tid: i32, cpus: &CpuSet, e: &std::io::Error) {
 /// 应用绑核（兼容包装，丢弃有效集回传）
 #[allow(dead_code)]
 pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpuset::CpuTopology) -> AffinityResult {
-    affinity_set_ex(tid, cpus, cpuset_dir, topo).0
+    affinity_set_ex(tid, cpus, cpuset_dir, topo, true).0
 }
 
 /// 应用绑核并回传实际生效目标。生效集与请求目标不同（在线核裁剪，或 EINVAL 后
 /// 按 Cpus_allowed_list 收缩）时返回 Some，供调用方回写缓存，避免每周期重复重试。
-pub fn affinity_set_ex(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpuset::CpuTopology)
+pub fn affinity_set_ex(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpuset::CpuTopology, verify_group: bool)
     -> (AffinityResult, Option<CpuSet>)
 {
     // 快速路径：目标含离线核则裁剪到在线核，裁剪发生时分组按新集合重算
@@ -143,9 +143,12 @@ pub fn affinity_set_ex(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::
     let report = |eff: &CpuSet| if *eff != *cpus { Some(eff.clone()) } else { None };
 
     // 短路：掩码与分组都符合才算达成目标。
-    // 只比对掩码会漏掉「掩码相同但仍在 top-app 等系统分组」的情况
+    // 只比对掩码会漏掉「掩码相同但仍在 top-app 等系统分组」的情况。
+    // 但 /proc/{tid}/cgroup 在千级线程下会形成读放大，故分组校验按需执行：
+    // 调用方仅在「该线程尚未确认过分组」（首次绑定 / 目标变更）时传 verify_group=true，
+    // 通过一次后即置标记跳过，稳态零读取
     if let Some(curr) = CpuSet::get_affinity(tid) {
-        if curr == *target && in_cpuset_dir(tid, dir) {
+        if curr == *target && (!verify_group || in_cpuset_dir(tid, dir)) {
             return (AffinityResult::Ok, report(target));
         }
     }
@@ -230,8 +233,16 @@ pub fn release_affinity(tid: i32, topo: &crate::cpuset::CpuTopology) {
 
 /// 读 /proc/{pid}/cmdline 取包名
 pub fn read_cmdline(pid: i32) -> Option<String> {
-    let cl = fs::read_to_string(format!("/proc/{}/cmdline", pid)).ok()?;
-    let pkg = cl.split('\0').next().unwrap_or("").trim_end_matches('\0').to_string();
+    use std::io::Read;
+    let mut f = fs::File::open(format!("/proc/{}/cmdline", pid)).ok()?;
+    // cmdline 是原始字节流，未必是合法 UTF-8（native 程序可自定义 argv[0]）。
+    // 用 read_to_string 会因编码错误整体失败，导致该进程被静默跳过、完全不绑核。
+    // 同时只读前 512 字节：包名在第一个 NUL 之前，无需读完整参数列表
+    let mut buf = [0u8; 512];
+    let n = f.read(&mut buf).ok()?;
+    let head = &buf[..n];
+    let end = head.iter().position(|&b| b == 0).unwrap_or(n);
+    let pkg = String::from_utf8_lossy(&head[..end]).trim().to_string();
     if pkg.is_empty() { None } else { Some(pkg) }
 }
 
@@ -271,14 +282,22 @@ pub fn is_background(pid: i32) -> bool {
 /// 返回 (utime+stime, 上次采集时间点)，None 表示读取失败
 #[allow(dead_code)]
 pub fn read_thread_cpu_time(tid: i32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{}/stat", tid)).ok()?;
-    // 格式: pid (comm) state ppid ... utime(14) stime(15) ...
-    // comm 可能含空格和括号，需跳过第一个 ) 后再 split
-    let after_comm = stat.find(')').map(|i| &stat[i + 2..])?;
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    if fields.len() < 15 { return None; }
-    let utime: u64 = fields[12].parse().ok()?;  // 第14个字段（从state算第13个）
-    let stime: u64 = fields[13].parse().ok()?;
+    use std::io::Read;
+    let mut f = fs::File::open(format!("/proc/{}/stat", tid)).ok()?;
+    // utime/stime 位于前 512 字节内，无需读全文件。原实现用 read_to_string
+    // 读完整内容再收集 Vec<&str>；调用方为避免给空闲线程开 perf fd 会逐线程
+    // 轮询，这个读放大正是周期性尖峰的主要来源
+    let mut buf = [0u8; 512];
+    let n = f.read(&mut buf).ok()?;
+    let s = std::str::from_utf8(&buf[..n]).ok()?;
+    // comm 可能含空格与括号，从最后一个 ')' 之后开始解析
+    let after = s.rfind(')')? + 1;
+    let mut it = s[after..].split_whitespace();
+    // 从 state 起编号：state(0) ppid(1) ... cmajflt(10) utime(11) stime(12)。
+    // 原实现取 fields[12]/[13]，实际读到 stime + cutime，漏掉了 utime ——
+    // CPU 密集线程 utime 占大头，会让负载被严重低估
+    let utime: u64 = it.nth(11)?.parse().ok()?;
+    let stime: u64 = it.next()?.parse().ok()?;
     Some(utime + stime)
 }
 

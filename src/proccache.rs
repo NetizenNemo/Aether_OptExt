@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use crate::config;
 use crate::cpuset::{ensure_cpuset_dir, CpuSet};
 use crate::process;
@@ -36,6 +36,10 @@ pub struct TaskEntry {
     /// （千级线程每轮上千次文件读），只在前 RENDER_CHECK_MAX 个周期探测，
     /// 线程改名通常发生在创建后很短的时间窗内
     render_checks: u8,
+    /// 已确认该线程位于目标 cpuset 分组内。分组校验需读 /proc/{tid}/cgroup，
+    /// 千级线程下是读放大来源；仅首次绑定与目标变更后需校验一次，
+    /// 通过后置位即可在稳态完全跳过该校验
+    group_ok: bool,
 }
 
 /// cap 存活周期数：到期后重探一次，保证核/分组恢复时能扩回配置目标
@@ -54,7 +58,13 @@ const PRUNE_INTERVAL: u8 = 20;
 
 /// λmod 采样降频：每 N 个 affinity_sync 周期推进一次。
 /// 取 3 意味着 -s 2（6s/轮）时约 18s 采样一次
-const LAGRANGE_TICK_DIV: u8 = 3;
+const LAGRANGE_TICK_DIV: u8 = 10;
+
+/// 前后台判定缓存有效期。前后台状态不会秒级翻转，而 affinity_sync 亮屏下
+/// 每 6 秒一轮、每轮对每个 pid 读一次 /proc/{pid}/oom_score_adj —— 这是
+/// 6 秒周期的细粒度抖动来源。缓存 25 秒可消掉绝大部分重复读取，
+/// 同时把「切后台后降档」的最大延迟控制在 25 秒内
+const BG_CACHE_TTL_SECS: u64 = 25;
 
 /// 亲和性强制校验周期。目标未变时跳过 sched_setaffinity 以省系统调用，
 /// 但外部 cgroup 迁移会静默重置亲和性，故每隔这么多周期强制校验一次
@@ -69,6 +79,10 @@ pub struct ProcCache {
     /// cpuset 空分组清理计数：配置切换 cpus 组合后旧分组会空置，
     /// 需定期回收，否则长期运行会在 base_cpuset 下堆积废弃目录
     prune_round: u8,
+    /// 前后台判定缓存：pid → 是否后台。按 BG_CACHE_TTL_SECS 整体失效重建
+    bg_cache: HashMap<i32, bool>,
+    /// 上面这份缓存的重建时刻
+    bg_cache_at: Option<Instant>,
     /// λmod 采样降频计数。每次采样需读每个线程的 /proc/{tid}/stat
     /// 做免 fd 预筛选（千级线程即千次文件读），而线程负载特征不会在
     /// 秒级内剧变，故每 LAGRANGE_TICK_DIV 个周期推进一次
@@ -77,7 +91,15 @@ pub struct ProcCache {
 
 impl ProcCache {
     pub fn new() -> Self {
-        Self { pkgs: HashMap::new(), tasks: HashMap::new(), last_sample: None, prune_round: 0, lambda_round: 0 }
+        Self {
+            pkgs: HashMap::new(),
+            tasks: HashMap::new(),
+            last_sample: None,
+            prune_round: 0,
+            bg_cache: HashMap::new(),
+            bg_cache_at: None,
+            lambda_round: 0,
+        }
     }
 
     pub fn clear(&mut self) {
@@ -168,6 +190,9 @@ impl ProcCache {
             // 初始即置为 TTL，表示「需要校验」：新线程虽已在 task_apply 绑过，
             // 但随后的 cpuset 迁移会重置亲和性，首个周期就该校验一次
             verified_age: VERIFY_TTL,
+            // 未校验：首次绑定走 task_apply，分组可能仍是系统默认，
+            // 例如渲染线程被提升到全核后掩码与系统默认一致
+            group_ok: false,
         });
         true
     }
@@ -270,20 +295,31 @@ impl ProcCache {
     }
 
     /// 遍历 tasks 应用亲和性，返回 dead_tids
-    pub fn affinity_sync(&mut self, cfg: &config::AppConfig) -> Vec<i32> {
+    pub fn affinity_sync(&mut self, cfg: &config::AppConfig, screen_on: bool) -> Vec<i32> {
         // 采样窗口换算为 tick（USER_HZ=100）
         let now = Instant::now();
         let window_secs = self.last_sample.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
         self.last_sample = Some(now);
         let elapsed_ticks = (window_secs * 100.0) as u64;
 
-        // 按 pid 缓存前后台判定，避免每个线程重复读 /proc
+        // 前后台判定：按 pid 去重 + 整体 TTL 缓存。
+        // 原实现每轮重建，亮屏下每 6 秒对每个 pid 读一次 oom_score_adj，
+        // 是周期抖动的来源之一
         let bg_cache: HashMap<i32, bool> = if cfg.foreground_aware {
-            let mut m = HashMap::new();
-            for e in self.tasks.values() {
-                m.entry(e.pid).or_insert_with(|| process::is_background(e.pid));
+            let stale = self
+                .bg_cache_at
+                .map(|t| t.elapsed() >= Duration::from_secs(BG_CACHE_TTL_SECS))
+                .unwrap_or(true);
+            if stale {
+                let mut m = HashMap::new();
+                for e in self.tasks.values() {
+                    m.entry(e.pid)
+                        .or_insert_with(|| process::is_background(e.pid));
+                }
+                self.bg_cache = m;
+                self.bg_cache_at = Some(Instant::now());
             }
-            m
+            self.bg_cache.clone()
         } else {
             HashMap::new()
         };
@@ -309,7 +345,9 @@ impl ProcCache {
         // λmod 周期推进：采样 → 求解 → 推进 λ → 刷新目标缓存。
         // 降频执行：采样阶段要读每个线程的 /proc/{tid}/stat，是当前最大的
         // 周期性开销；targets 缓存会让降频期间仍沿用上次决策
-        if crate::lagrange::active() {
+        // 息屏时完全跳过采样：此时无前台应用、无渲染提交，采样没有收益。
+        // 亮屏下再按 LAGRANGE_TICK_DIV 降频，避免每轮都读千级 /proc/{tid}/stat
+        if crate::lagrange::active() && screen_on {
             self.lambda_round = self.lambda_round.wrapping_add(1);
             if self.lambda_round % LAGRANGE_TICK_DIV == 0 {
                 let tids: Vec<i32> = self.tasks.keys().copied().collect();
@@ -341,6 +379,10 @@ impl ProcCache {
             }
             let is_bg = bg_cache.get(&e.pid).copied().unwrap_or(false);
             let changed = Self::adjust_target(*tid, e, cfg, elapsed_ticks, is_bg);
+            // 目标变更后分组尚未写入，需重新确认一次
+            if changed {
+                e.group_ok = false;
+            }
             // 目标未变且未到强制校验周期 → 跳过 sched_setaffinity。
             // 千级线程每轮上千次系统调用，而亲和性在稳态下不会自行漂移
             if !changed && e.verified_age < VERIFY_TTL {
@@ -348,14 +390,17 @@ impl ProcCache {
                 continue;
             }
             e.verified_age = 0;
-            let (res, eff) = process::affinity_set_ex(*tid, &e.cpus, &e.cpuset_dir, topo);
+            // 仅在尚未确认分组时读 /proc/{tid}/cgroup，稳态零读取
+            let verify = !e.group_ok;
+            let (res, eff) = process::affinity_set_ex(*tid, &e.cpus, &e.cpuset_dir, topo, verify);
             match res {
                 process::AffinityResult::Dead => dead_tids.push(*tid),
                 process::AffinityResult::Failed => {
                     e.failed = true;
                     e.fail_age = 0;
+                    e.group_ok = false;
                 }
-                process::AffinityResult::Ok => {}  // 成功，不标记失败
+                process::AffinityResult::Ok => e.group_ok = true,
             }
             // 目标被内核限缩：记录 cap 并按生效集更新，后续周期零开销短路
             if let Some(eff) = eff {
@@ -367,6 +412,7 @@ impl ProcCache {
                 };
                 e.cap = eff;
                 e.cap_age = 0;
+                e.group_ok = false;
             } else if e.cap.count() > 0 {
                 // 无新的限缩信息：cap 到期则清空重探，使核恢复后能扩回配置目标
                 e.cap_age = e.cap_age.saturating_add(1);
@@ -377,6 +423,7 @@ impl ProcCache {
                     e.cap_age = 0;
                     e.cpus = e.base_cpus;
                     e.cpuset_dir = ensure_cpuset_dir(&e.base_cpus, topo);
+                    e.group_ok = false;
                 }
             }
         }
