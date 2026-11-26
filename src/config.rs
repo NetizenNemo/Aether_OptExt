@@ -1,12 +1,107 @@
 use std::{collections::HashSet, fs, time::SystemTime};
 
+/// 通配符 token：字面字符 / 单字符 / 任意长度 / 字符类
+#[derive(Clone)]
+enum GlobToken {
+    Lit(char),
+    Any,
+    Star,
+    /// 字符类，支持 `[abc]` / `[a-z]` / `[0-9]` / `[!abc]`（取反）
+    Class { singles: Vec<char>, ranges: Vec<(char, char)>, negated: bool },
+}
+
+/// 把模式解析成 token 流。未闭合的 `[` 退化为字面字符，避免整条规则失效。
+fn parse_glob(pat: &str) -> Vec<GlobToken> {
+    let chars: Vec<char> = pat.chars().collect();
+    let mut tokens = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => { tokens.push(GlobToken::Star); i += 1; }
+            '?' => { tokens.push(GlobToken::Any); i += 1; }
+            '[' => {
+                let start = i + 1;
+                let mut j = start;
+                // 取反字符若在首位，不参与 ']' 的字面判定
+                if j < chars.len() && (chars[j] == '!' || chars[j] == '^') { j += 1; }
+                // `]` 紧跟 `[` 或 `[!` 时按字面字符处理
+                if j < chars.len() && chars[j] == ']' { j += 1; }
+                while j < chars.len() && chars[j] != ']' { j += 1; }
+                if j >= chars.len() {
+                    tokens.push(GlobToken::Lit('['));
+                    i += 1;
+                    continue;
+                }
+                let inner = &chars[start..j];
+                let (negated, body) = if inner.first().is_some_and(|c| *c == '!' || *c == '^') {
+                    (true, &inner[1..])
+                } else {
+                    (false, inner)
+                };
+                let mut singles = Vec::new();
+                let mut ranges = Vec::new();
+                let mut k = 0;
+                while k < body.len() {
+                    if k + 2 < body.len() && body[k + 1] == '-' {
+                        ranges.push((body[k], body[k + 2]));
+                        k += 3;
+                    } else {
+                        singles.push(body[k]);
+                        k += 1;
+                    }
+                }
+                tokens.push(GlobToken::Class { singles, ranges, negated });
+                i = j + 1;
+            }
+            c => { tokens.push(GlobToken::Lit(c)); i += 1; }
+        }
+    }
+    tokens
+}
+
+fn token_matches(tok: &GlobToken, c: char) -> bool {
+    match tok {
+        GlobToken::Lit(x) => *x == c,
+        GlobToken::Any => true,
+        GlobToken::Class { singles, ranges, negated } => {
+            let hit = singles.contains(&c) || ranges.iter().any(|(lo, hi)| *lo <= c && c <= *hi);
+            if *negated { !hit } else { hit }
+        }
+        GlobToken::Star => false,
+    }
+}
+
+/// glob 匹配：`*` 任意长度、`?` 单字符、`[range]` 字符类。
+/// 用滚动数组 DP，O(模式长度 × 名字长度)；线程名 ≤ 15 字节、包名一般百字以内，开销可忽略。
+/// 注意：空模式沿用旧语义返回 false（调用方不会传空模式）。
 pub fn fnmatch(pat: &str, name: &str) -> bool {
     if pat.is_empty() { return false; }
-    match pat.find('*') {
-        None => pat == name,
-        Some(pos) => name.starts_with(&pat[..pos])
-            && (pat[pos+1..].is_empty() || name[pos..].ends_with(&pat[pos+1..]))
+    let tokens = parse_glob(pat);
+    let name: Vec<char> = name.chars().collect();
+    let n = name.len();
+    let mut dp = vec![false; n + 1];
+    dp[0] = true;
+    for tok in &tokens {
+        let mut next = vec![false; n + 1];
+        match tok {
+            GlobToken::Star => {
+                // star 吞零个字符时沿用 dp[j]；吞一个字符时延续 next[j-1]
+                next[0] = dp[0];
+                for j in 1..=n {
+                    next[j] = dp[j] || next[j - 1];
+                }
+            }
+            _ => {
+                for j in 0..n {
+                    if dp[j] && token_matches(tok, name[j]) {
+                        next[j + 1] = true;
+                    }
+                }
+            }
+        }
+        dp = next;
     }
+    dp[n]
 }
 
 fn rule_prio(pat: &str) -> i32 {
@@ -94,9 +189,32 @@ pub struct AppConfig {
     /// λmod：基于拉格朗日乘子 + perf_event 实测的绑核求解（默认 true）。
     /// 开启时取代 load_aware 的 tick 启发式
     pub lagrange_enable: bool,
+    /// 精确包名 → rules 下标列表。线程规则匹配原本对每个线程线性遍历全部规则，
+    /// 千级线程 × 数百规则在首次全量 apply 时是百万次字符串比较。建索引后
+    /// 每线程只看自己包名的规则，复杂度降到 O(该包规则数)。
+    /// 仅对精确 pkg 建索引（rule_match 内部就是精确比较），含通配的 pkg 不进索引。
+    pub rule_index: std::collections::HashMap<String, Vec<usize>>,
 }
 
 impl AppConfig {
+    /// 重建规则索引。必须在任何 rules 增删/retain 之后调用——
+    /// apply_blacklist/apply_asoul_ignore 的 retain 会使旧下标失效。
+    pub fn rebuild_rule_index(&mut self) {
+        let mut index: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, r) in self.rules.iter().enumerate() {
+            if !r.pkg.contains('*') && !r.pkg.contains('?') && !r.pkg.contains('[') {
+                index.entry(r.pkg.clone()).or_default().push(i);
+            }
+        }
+        self.rule_index = index;
+    }
+
+    /// 取某包名的规则下标切片，未命中返回空
+    pub fn rule_indices(&self, pkg: &str) -> &[usize] {
+        self.rule_index.get(pkg).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
     /// 包名是否命中黑名单（含 :suffix 进程按其 base_pkg 判定）
     pub fn in_blacklist(&self, pkg: &str) -> bool {
         if self.blacklist.is_empty() { return false; }
@@ -110,6 +228,7 @@ impl AppConfig {
         cache::merge(&mut self.pkg_set, &mut self.rules);
         self.apply_blacklist();
         self.apply_asoul_ignore();
+        self.rebuild_rule_index();
     }
 }
 
@@ -212,9 +331,11 @@ impl AppConfig {
             asoul_ignore: HashSet::new(),
             foreground_aware, load_aware, notify_scheduler,
             blacklist, render_guard, min_cpus, lagrange_enable,
+            rule_index: std::collections::HashMap::new(),
         };
         cfg.apply_blacklist();
         cfg.apply_asoul_ignore();
+        cfg.rebuild_rule_index();
         Some(cfg)
     }
 
@@ -417,5 +538,59 @@ pub mod cache {
         if name.contains("Io") || name.contains("Network") || name.contains("Http") { return 3; }
         if name.contains("Background") || name.contains("Idle") || name.contains("Pool") { return 1; }
         5
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fnmatch_exact() {
+        assert!(fnmatch("UnityMain", "UnityMain"));
+        assert!(!fnmatch("UnityMain", "UnityMain2"));
+        assert!(!fnmatch("", "anything"));
+    }
+
+    #[test]
+    fn fnmatch_star() {
+        assert!(fnmatch("Render*", "RenderThread"));
+        assert!(fnmatch("Render*", "Render"));
+        assert!(!fnmatch("Render*", "PreRender"));
+        assert!(fnmatch("com.*.game", "com.foo.game"));
+        // 多个 * 曾是字面量，现在应正常工作
+        assert!(fnmatch("*Thread-*", "UnityThread-123"));
+        assert!(fnmatch("a*b*c", "aXXbYYc"));
+        assert!(!fnmatch("a*b*c", "aXXbYY"));
+    }
+
+    #[test]
+    fn fnmatch_question() {
+        assert!(fnmatch("Thread-???", "Thread-123"));
+        assert!(!fnmatch("Thread-???", "Thread-12"));
+        assert!(!fnmatch("Thread-???", "Thread-1234"));
+        // 与 * 组合
+        assert!(fnmatch("Thread-??*", "Thread-12abc"));
+    }
+
+    #[test]
+    fn fnmatch_class() {
+        assert!(fnmatch("Thread-[0-9]", "Thread-5"));
+        assert!(!fnmatch("Thread-[0-9]", "Thread-x"));
+        assert!(fnmatch("GLThread[12]", "GLThread1"));
+        assert!(!fnmatch("GLThread[12]", "GLThread3"));
+        // 取反类
+        assert!(fnmatch("Thread-[!0-9]", "Thread-x"));
+        assert!(!fnmatch("Thread-[!0-9]", "Thread-5"));
+        // 未闭合的 [ 退化为字面字符，不炸整条规则
+        assert!(fnmatch("Thread-[abc", "Thread-[abc"));
+    }
+
+    #[test]
+    fn glob_priority_order() {
+        // 优先级算法承诺的排序关系必须成立
+        assert!(rule_prio("UnityMain") > rule_prio("Thread-[0-9]"));
+        assert!(rule_prio("Thread-[0-9]") > rule_prio("Thread-???"));
+        assert!(rule_prio("Thread-???") > rule_prio("Render*"));
     }
 }

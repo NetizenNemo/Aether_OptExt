@@ -49,6 +49,8 @@ write_desc() {
 
 update_module_desc
 
+# 主动清掉旧实例（覆盖升级/重启场景）；二进制内部另有 flock 独占锁兜底，
+# 防止 D 态未杀干净时双开互相踩绑核/分组/fg_hint
 pkill "aether-optext" 2>/dev/null
 sleep 1
 

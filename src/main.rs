@@ -117,7 +117,7 @@ fn event_affinity_apply(tid: i32, cpus: &CpuSet, cpuset_dir: &str, cfg: &AppConf
 {
     // 首次绑定必须校验分组：渲染线程被提升到全核后掩码与系统默认一致，
     // 只比掩码会漏判而永不迁入 OptExt 分组
-    let (res, eff) = process::affinity_set_ex(tid, cpus, cpuset_dir, &cfg.topo, true);
+    let (res, eff, _group_ok) = process::affinity_set_ex(tid, cpus, cpuset_dir, &cfg.topo, true);
     match res {
         process::AffinityResult::Dead => (true, None),
         _ => {
@@ -310,8 +310,36 @@ fn proc_cache_sync(state: &mut ProcState, cfg: &AppConfig) -> bool {
     true
 }
 
+/// 进程独占锁。service.sh 的 pkill + sleep 1 无法保证旧实例已退出（D 态杀不干净），
+/// 两个实例同时绑核/写 fg_hint/改 cpuset 会互相踩。用 flock 保证全局只有一个实例。
+/// 锁 fd 持有到进程结束（不 close），由内核在进程退出时自动释放。
+static INSTANCE_LOCK_FD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+fn acquire_instance_lock() -> bool {
+    use std::os::unix::io::AsRawFd;
+    let file = match std::fs::OpenOptions::new()
+        .create(true).read(true).write(true)
+        .open("/data/adb/aether-optext.lock")
+    {
+        Ok(f) => f,
+        Err(_) => {
+            // /data/adb 不可写时（非 Magisk/KSU 环境，如本地调试）不阻断运行
+            return true;
+        }
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return false;
+    }
+    INSTANCE_LOCK_FD.set(file).ok();
+    true
+}
+
 fn main() {
-    // 进程锁
+    if !acquire_instance_lock() {
+        eprintln!("[Aether] another instance is running, exit");
+        return;
+    }
+
     std::panic::set_hook(Box::new(|info| {
         let msg = info.payload().downcast_ref::<&str>().copied()
             .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
@@ -354,13 +382,13 @@ fn main() {
     cfg.merge_cache();
     info!("total rules (with cache): {}", cfg.rules.len());
 
-    let (big, mid1, mid2, little, topo) = cpu::detect();
+    let (big, mid1, mid2, little, topo_str) = cpu::detect(&topo);
     let mid_str = if mid1.is_empty() && mid2.is_empty() {
         "无".to_string()
     } else {
         format!("{}{}{}", mid1, if !mid1.is_empty() && !mid2.is_empty() { "+" } else { "" }, mid2)
     };
-    info!("topology: {} (big={} mid={} little={})", topo, big, mid_str, little);
+    info!("topology: {} (big={} mid={} little={})", topo_str, big, mid_str, little);
 
 
     // 自身限定在小核运行

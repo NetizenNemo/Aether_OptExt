@@ -105,6 +105,12 @@ impl ProcCache {
     pub fn clear(&mut self) {
         self.pkgs.clear();
         self.tasks.clear();
+        // 全量重建（配置重载 / 白名单容量变化）必须一并重置采样时钟与缓存，
+        // 否则 elapsed_ticks 会跨扫描沿用旧时间戳，前后台判定也带着旧 pid 的残留状态
+        self.last_sample = None;
+        self.bg_cache.clear();
+        self.bg_cache_at = None;
+        self.lambda_round = 0;
     }
 
     /// 删除 tid，若该 pid 下无线程则清理 pkgs[pid]
@@ -392,7 +398,7 @@ impl ProcCache {
             e.verified_age = 0;
             // 仅在尚未确认分组时读 /proc/{tid}/cgroup，稳态零读取
             let verify = !e.group_ok;
-            let (res, eff) = process::affinity_set_ex(*tid, &e.cpus, &e.cpuset_dir, topo, verify);
+            let (res, eff, group_ok) = process::affinity_set_ex(*tid, &e.cpus, &e.cpuset_dir, topo, verify);
             match res {
                 process::AffinityResult::Dead => dead_tids.push(*tid),
                 process::AffinityResult::Failed => {
@@ -400,7 +406,11 @@ impl ProcCache {
                     e.fail_age = 0;
                     e.group_ok = false;
                 }
-                process::AffinityResult::Ok => e.group_ok = true,
+                process::AffinityResult::Ok => {
+                    // 掩码绑对但 cpuset tasks 写入失败时不得标记就绪，
+                    // 否则线程滞留系统分组且稳态不再复核
+                    e.group_ok = group_ok;
+                }
             }
             // 目标被内核限缩：记录 cap 并按生效集更新，后续周期零开销短路
             if let Some(eff) = eff {

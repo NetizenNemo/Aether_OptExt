@@ -739,6 +739,17 @@ pub fn tick(tids: &[i32], cfg: &AppConfig) -> usize {
     lm.retain_nodes(&keep);
     lm.retain_targets(&keep);
 
+    // 单活跃线程特判：solve() 的 salt 每轮递增、pick_tier 每轮按 probs 重采样，
+    // 单个线程会被随机甩到不同层 → adjust_target 每轮 changed=true → 每轮 setaffinity。
+    // 此时锁定的旧目标就是该线程的稳定归属，直接沿用、不推进 λ 与层分配。
+    // 多线程恢复后 solve 会继续正常收敛（λ 停留在旧值无妨，会在后续轮次重新配平）。
+    if n == 1 {
+        let tid = sampled[0];
+        if lm.get_target(tid).is_some() {
+            return n;
+        }
+    }
+
     let (assign, _s) = lm.solve();
     lm.advance(&_s);
 

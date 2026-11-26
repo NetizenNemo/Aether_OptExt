@@ -4,85 +4,23 @@ pub fn present() -> String {
         .unwrap_or_default().trim().to_string()
 }
 
-/// 检测 CPU 集群，返回 (大核, 中核高, 中核低, 小核, 拓扑描述)
-/// 2 层: mid1/mid2 空; 3 层: mid1=中间层, mid2 空; 4 层: mid1/mid2 各一层
-pub fn detect() -> (String, String, String, String, String) {
-    let mut cls: Vec<(u64, Vec<usize>)> = Vec::new();
-    // 方法1: cpufreq policy 目录
-    if let Ok(dir) = std::fs::read_dir("/sys/devices/system/cpu/cpufreq") {
-        for e in dir.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !name.starts_with("policy") { continue; }
-            let rel = match std::fs::read_to_string(e.path().join("related_cpus")) {
-                Ok(x) => x.trim().to_string(), Err(_) => continue
-            };
-            let f_str = match std::fs::read_to_string(e.path().join("cpuinfo_max_freq")) {
-                Ok(x) => x.trim().to_string(), Err(_) => continue
-            };
-            let freq: u64 = match f_str.parse() { Ok(f) => f, Err(_) => continue };
-            let mut cpus = Vec::new();
-            for part in rel.split(|c: char| c == ',' || c == ' ') {
-                let part = part.trim();
-                if part.is_empty() { continue; }
-                if let Some((a, b)) = part.split_once('-') {
-                    let s: usize = a.parse().unwrap_or(0);
-                    let e: usize = b.parse().unwrap_or(s);
-                    for cpu in s..=e { cpus.push(cpu); }
-                } else if let Ok(c) = part.parse::<usize>() { cpus.push(c); }
-            }
-            if !cpus.is_empty() { cls.push((freq, cpus)); }
-        }
+/// 从唯一的拓扑源 CpuTopology 派生 (大核, 中核高, 中核低, 小核, 拓扑描述)。
+/// 此前本函数独立读 sysfs，与 cpuset::detect_core_types() 各写一套逻辑且兜底策略不同：
+/// cpufreq 不可用时这里还能给出 big/little 分级、那边却返回空层，导致 auto 分配与
+/// 实际绑核行为分叉。现在统一以 init_cpu_topo() 的检测结果为准，消除双份实现。
+/// all_tiers 按频率升序（e → … → hp），故最高层是 hp、最低层是 e。
+pub fn detect(topo: &crate::cpuset::CpuTopology) -> (String, String, String, String, String) {
+    let tiers = &topo.all_tiers;
+    if tiers.is_empty() {
+        return (topo.present_str.clone(), String::new(), String::new(), topo.present_str.clone(), "1".into());
     }
-    // 方法2: 逐个读 CPU 频率 (策略1失败时)
-    if cls.len() < 2 {
-        cls.clear();
-        for cpu in 0..128 {
-            let fp = format!("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu);
-            let f_str = match std::fs::read_to_string(&fp) { Ok(x) => x.trim().to_string(), Err(_) => break };
-            let freq: u64 = match f_str.parse() { Ok(f) => f, Err(_) => continue };
-            let mut found = false;
-            for (f, cpus) in &mut cls {
-                if *f == freq { cpus.push(cpu); found = true; break; }
-            }
-            if !found { cls.push((freq, vec![cpu])); }
-        }
-    }
-    cls.sort_by(|a, b| b.0.cmp(&a.0)); // 按频率降序
-    // 兜底: present > 检测到的核心数时，按 present 拆分 (离线大核)
-    if cls.len() < 2 {
-        let known: usize = cls.iter().map(|(_, c)| c.len()).sum();
-        let total: usize = present().split(|c| c == ',' || c == '-')
-            .filter_map(|s| s.parse::<usize>().ok()).last().unwrap_or(0) + 1;
-        if total > known && known > 0 {
-            let known_set: std::collections::HashSet<usize> =
-                cls.iter().flat_map(|(_, c)| c.iter()).cloned().collect();
-            let extra: Vec<usize> = (0..total).filter(|c| !known_set.contains(c)).collect();
-            if !extra.is_empty() {
-                let cur = cls.remove(0).1;
-                cls.push((1, extra));  // 未检测到的核作为大核
-                cls.push((0, cur));    // 已知核作为小核
-            }
-        }
-    }
-    if cls.is_empty() { return ("0".into(), "".into(), "".into(), "0".into(), "1".into()); }
-    let big = fmt_cpus(&cls[0].1);
-    let little = fmt_cpus(&cls.last().unwrap().1);
-    let mid1 = if cls.len() >= 3 { fmt_cpus(&cls[1].1) } else { "".to_string() };
-    let mid2 = if cls.len() >= 4 { fmt_cpus(&cls[2].1) } else { "".to_string() };
-    let topo = cls.iter().map(|(_, c)| c.len().to_string()).collect::<Vec<_>>().join("+");
-    (big, mid1, mid2, little, topo)
+    let big = tiers.last().unwrap().to_range_string();
+    let little = tiers.first().unwrap().to_range_string();
+    // 4 层示例 1+2+2+3（升序 e=[0], p1=[1-2], p2=[3-4], hp=[5-7]）：
+    // mid1 = 第二层 [1-2]，mid2 = 第三层 [3-4]，与 p_core 合并顺序一致
+    let mid1 = if tiers.len() >= 3 { tiers[1].to_range_string() } else { String::new() };
+    let mid2 = if tiers.len() >= 4 { tiers[2].to_range_string() } else { String::new() };
+    let topo_str = tiers.iter().map(|c| c.count().to_string()).collect::<Vec<_>>().join("+");
+    (big, mid1, mid2, little, topo_str)
 }
 
-fn fmt_cpus(cpus: &[usize]) -> String {
-    if cpus.is_empty() { return "0".into(); }
-    let mut parts = Vec::new();
-    let mut i = 0;
-    while i < cpus.len() {
-        let start = cpus[i];
-        let mut end = start;
-        while i + 1 < cpus.len() && cpus[i+1] == end + 1 { i += 1; end = cpus[i]; }
-        if start == end { parts.push(start.to_string()); } else { parts.push(format!("{}-{}", start, end)); }
-        i += 1;
-    }
-    parts.join(",")
-}

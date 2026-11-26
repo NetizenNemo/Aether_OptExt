@@ -30,7 +30,10 @@ pub fn read(fd: i32) -> Option<u8> {
     let mut reload = false;
     let mut rewatch = false;
     while off + hdr <= n as usize {
-        let ev = unsafe { &*(buf.as_ptr().add(off) as *const libc::inotify_event) };
+        // buf 是 [u8;1024]，只有 1 字节对齐；inotify_event 含 u32 字段需 4 字节对齐。
+        // 直接 &* 强转解引用是 UB，x86 上侥幸能跑但严格未定义。用 read_unaligned 拷贝。
+        let ev: libc::inotify_event =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const libc::inotify_event) };
         if ev.mask & libc::IN_CLOSE_WRITE != 0 { reload = true; }
         if ev.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 { reload = true; rewatch = true; }
         off += hdr + ev.len as usize;

@@ -145,12 +145,23 @@ pub fn probe(enable: bool) -> BpfCtx {
         return BpfCtx::empty();
     }
 
+    // 后续初始化若失败，wakeup_fd 尚未交给 BpfCtx::drop 接管，必须在此显式关闭，
+    // 否则回退 /proc 轮询后该 fd 永久泄漏（进程长期运行会累积）
+    let close_wakeup = || unsafe { libc::close(wakeup_fd); };
     let ring_buf = match bpf.take_map("EVENTS") {
         Some(map) => match RingBuf::try_from(map) {
             Ok(rb) => rb,
-            Err(e) => { crate::error!("[ebpf] EVENTS RingBuf failed ({:?})", e); return BpfCtx::empty(); }
+            Err(e) => {
+                crate::error!("[ebpf] EVENTS RingBuf failed ({:?})", e);
+                close_wakeup();
+                return BpfCtx::empty();
+            }
         },
-        None => { crate::error!("[ebpf] take_map(EVENTS) failed"); return BpfCtx::empty(); }
+        None => {
+            crate::error!("[ebpf] take_map(EVENTS) failed");
+            close_wakeup();
+            return BpfCtx::empty();
+        }
     };
 
     let reader = thread::spawn(move || ebpf_reader(ring_buf, tx, wakeup_fd));

@@ -90,20 +90,22 @@ pub fn read_allowed_cpus(tid: i32) -> Option<CpuSet> {
     None
 }
 
-/// 将 tid 写入 cpuset 分组 tasks（dir 为空写 BASE_CPUSET 根），返回路径
-fn write_cpuset_tasks(tid: i32, dir: &str, topo: &crate::cpuset::CpuTopology) -> Option<String> {
-    if !topo.cpuset_enabled { return None; }
+/// 将 tid 写入 cpuset 分组 tasks（dir 为空写 BASE_CPUSET 根）。
+/// 返回 true 表示无需写入（cpuset 未启用）或写入成功；false 表示写入失败。
+/// 调用方据此决定是否重置 group_ok —— 掩码绑对但分组写入失败时若标记分组已就绪，
+/// 稳态将不再复核，线程滞留在系统分组，thermal 收缩时受错误 cpuset 约束。
+fn write_cpuset_tasks(tid: i32, dir: &str, topo: &crate::cpuset::CpuTopology) -> bool {
+    if !topo.cpuset_enabled { return true; }
     let tasks_path = if dir.is_empty() {
         format!("{}/tasks", crate::common::base_cpuset())
     } else {
         format!("{}/{}/tasks", crate::common::base_cpuset(), dir)
     };
-    let _ = fs::OpenOptions::new()
+    fs::OpenOptions::new()
         .append(true)
         .open(&tasks_path)
-        .and_then(|mut f| f.write_all(format!("{}
-", tid).as_bytes()));
-    Some(tasks_path)
+        .and_then(|mut f| f.write_all(format!("{}\n", tid).as_bytes()))
+        .is_ok()
 }
 
 fn log_bind_fail(tid: i32, cpus: &CpuSet, e: &std::io::Error) {
@@ -121,8 +123,10 @@ pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpu
 
 /// 应用绑核并回传实际生效目标。生效集与请求目标不同（在线核裁剪，或 EINVAL 后
 /// 按 Cpus_allowed_list 收缩）时返回 Some，供调用方回写缓存，避免每周期重复重试。
+/// 第三个返回值表示 cpuset 分组是否已就绪：写入失败时调用方不得标记 group_ok，
+/// 否则掩码虽对、线程仍滞留系统分组且稳态不再复核。
 pub fn affinity_set_ex(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpuset::CpuTopology, verify_group: bool)
-    -> (AffinityResult, Option<CpuSet>)
+    -> (AffinityResult, Option<CpuSet>, bool)
 {
     // 快速路径：目标含离线核则裁剪到在线核，裁剪发生时分组按新集合重算
     let clipped = topo.clip_online(cpus);
@@ -149,14 +153,15 @@ pub fn affinity_set_ex(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::
     // 通过一次后即置标记跳过，稳态零读取
     if let Some(curr) = CpuSet::get_affinity(tid) {
         if curr == *target && (!verify_group || in_cpuset_dir(tid, dir)) {
-            return (AffinityResult::Ok, report(target));
+            // 短路成立：要么分组本就正确，要么无需校验，均视为分组就绪
+            return (AffinityResult::Ok, report(target), true);
         }
     }
 
-    write_cpuset_tasks(tid, dir, topo);
+    let group_ok = write_cpuset_tasks(tid, dir, topo);
 
     if let Err(e) = target.set_affinity(tid) {
-        if e.raw_os_error() == Some(3) { return (AffinityResult::Dead, None); }  // ESRCH: 线程已退出
+        if e.raw_os_error() == Some(3) { return (AffinityResult::Dead, None, group_ok); }  // ESRCH: 线程已退出
         if e.raw_os_error() == Some(22) {
             // EINVAL：内核拒绝（核被 hotplug 下线，或 cpuset effective 被 thermal 收缩）。
             // 以该任务真实可用核（Cpus_allowed_list = online ∩ 各级 cpuset effective）收缩后重试。
@@ -168,22 +173,22 @@ pub fn affinity_set_ex(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::
                 } else {
                     String::new()
                 };
-                write_cpuset_tasks(tid, &eff_dir, topo);
+                let eff_group_ok = write_cpuset_tasks(tid, &eff_dir, topo);
                 let r = report(&eff);
                 return match eff.set_affinity(tid) {
-                    Ok(()) => (AffinityResult::Ok, r),
-                    Err(e2) if e2.raw_os_error() == Some(3) => (AffinityResult::Dead, None),
+                    Ok(()) => (AffinityResult::Ok, r, eff_group_ok),
+                    Err(e2) if e2.raw_os_error() == Some(3) => (AffinityResult::Dead, None, eff_group_ok),
                     Err(e2) => {
                         log_bind_fail(tid, &eff, &e2);
-                        (AffinityResult::Failed, r)
+                        (AffinityResult::Failed, r, eff_group_ok)
                     }
                 };
             }
         }
         log_bind_fail(tid, target, &e);
-        return (AffinityResult::Failed, report(target));
+        return (AffinityResult::Failed, report(target), group_ok);
     }
-    (AffinityResult::Ok, report(target))
+    (AffinityResult::Ok, report(target), group_ok)
 }
 
 /// 读线程所属进程的 Tgid（主线程 pid），失败返回 None

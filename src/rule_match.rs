@@ -84,9 +84,14 @@ pub fn thread_affinity(pkg: &str, thread: &str, cfg: &AppConfig, topo: &CpuTopol
     let mut cpuset_dir = String::new();
     let mut matched = false;
 
+    // 用包名索引替代全量遍历：rule_match 内部本就是精确 pkg 比较，
+    // 索引里只放精确包名规则，遍历量与全量规则数解耦
+    let indices = cfg.rule_indices(pkg);
+
     if !thread.is_empty() {
-        for rule in &cfg.rules {
-            if rule.pkg != pkg || rule.thread.is_empty() {
+        for &i in indices {
+            let rule = &cfg.rules[i];
+            if rule.thread.is_empty() {
                 continue;
             }
             if config::fnmatch(&rule.thread, thread) {
@@ -102,8 +107,9 @@ pub fn thread_affinity(pkg: &str, thread: &str, cfg: &AppConfig, topo: &CpuTopol
 
     if !matched {
         let mut fallback_seen = false;
-        for rule in &cfg.rules {
-            if rule.pkg != pkg || !rule.thread.is_empty() {
+        for &i in indices {
+            let rule = &cfg.rules[i];
+            if !rule.thread.is_empty() {
                 continue;
             }
             cpus.or(&cpuset_from_rule(rule));
